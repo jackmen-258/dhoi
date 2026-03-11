@@ -208,6 +208,53 @@ class RefineNet(nn.Module):
         # 接口: mano_fn(pose_aa_48, trans_3, shape_10) → (verts, joints)
         self.mano_fn = None
 
+    def _normalize_h2o(self, h2o_dist):
+        """
+        BatchNorm1d 在训练态下要求 batch size > 1。
+        小 batch 调试时退化为使用 running stats，避免无意义崩溃。
+        """
+        if self.training and h2o_dist.shape[0] == 1:
+            return F.batch_norm(
+                h2o_dist,
+                self.bn1.running_mean,
+                self.bn1.running_var,
+                self.bn1.weight,
+                self.bn1.bias,
+                training=False,
+                momentum=0.0,
+                eps=self.bn1.eps,
+            )
+        return self.bn1(h2o_dist)
+
+    def _check_inputs(self, coarse_pose_aa, coarse_trans, shape, verts_object):
+        if self.mano_fn is None:
+            raise RuntimeError(
+                "RefineNet.mano_fn is not set. Inject a MANO callable before forward, "
+                "e.g. model.mano_fn = mano_helper."
+            )
+
+        if coarse_pose_aa.ndim != 2 or coarse_pose_aa.shape[1] != 48:
+            raise ValueError(
+                f"coarse_pose_aa must have shape (B, 48), got {tuple(coarse_pose_aa.shape)}"
+            )
+        if coarse_trans.ndim != 2 or coarse_trans.shape[1] != TRANS_DIM:
+            raise ValueError(
+                f"coarse_trans must have shape (B, 3), got {tuple(coarse_trans.shape)}"
+            )
+        if shape.ndim != 2:
+            raise ValueError(f"shape must have shape (B, 10), got {tuple(shape.shape)}")
+        if verts_object.ndim != 3 or verts_object.shape[-1] != 3:
+            raise ValueError(
+                f"verts_object must have shape (B, N, 3), got {tuple(verts_object.shape)}"
+            )
+
+        batch_size = coarse_pose_aa.shape[0]
+        if coarse_trans.shape[0] != batch_size or shape.shape[0] != batch_size or verts_object.shape[0] != batch_size:
+            raise ValueError("Batch size mismatch among refine inputs.")
+
+    def forward(self, *args, **kwargs):
+        return self.forward_simple(*args, **kwargs)
+
     def forward_simple(
         self,
         coarse_pose_aa,
@@ -234,6 +281,8 @@ class RefineNet(nn.Module):
         Returns:
             dict: {'global_orient': (B,3), 'hand_pose': (B,45), 'transl': (B,3)}
         """
+        self._check_inputs(coarse_pose_aa, coarse_trans, shape, verts_object)
+
         # ---- 初始 h2o_dist (无梯度, 来自 coarse) ----
         with torch.no_grad():
             coarse_verts, _ = self.mano_fn(coarse_pose_aa, coarse_trans, shape)
@@ -258,7 +307,7 @@ class RefineNet(nn.Module):
                     verts_rhand, verts_object, y_normals=obj_vn)
 
             # 网络前向
-            h2o_normed = self.bn1(h2o_dist)
+            h2o_normed = self._normalize_h2o(h2o_dist)
             X0 = torch.cat([h2o_normed, init_pose, init_trans], dim=1)
 
             X = self.rb1(X0)

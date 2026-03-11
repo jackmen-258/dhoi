@@ -335,11 +335,15 @@ class Trainer:
             cate_counts = defaultdict(int)
             for s in self.train_ds.samples:
                 cate_counts[s["cate_id"]] += 1
-            weights = [1.0 / cate_counts[s["cate_id"]]
-                       for s in self.train_ds.samples]
+            weights = [
+                1.0 / math.sqrt(cate_counts[s["cate_id"]])
+                for s in self.train_ds.samples
+            ]
             sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
             shuffle = False
-            self.logger.info(f"Balanced sampling: {len(cate_counts)} categories")
+            self.logger.info(
+                f"Balanced sampling: sqrt-inverse over {len(cate_counts)} categories"
+            )
 
         self.train_dl = DataLoader(
             self.train_ds, batch_size=cfg.batch_size,
@@ -675,6 +679,11 @@ def parse_args():
     p.add_argument("--save_dir",     type=str, default="checkpoints/decoder")
     p.add_argument("--log_dir",      type=str, default="logs/decoder")
     p.add_argument("--seed",         type=int, default=904)
+    p.add_argument(
+        "--balanced_sampling",
+        action="store_true",
+        help="使用 1/sqrt(category_count) 的弱类别均衡采样",
+    )
 
     return p.parse_args()
 
@@ -700,6 +709,7 @@ def main():
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         seed=args.seed,
+        balanced_sampling=args.balanced_sampling,
     )
     Trainer(cfg).train()
 

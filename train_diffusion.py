@@ -300,10 +300,15 @@ class DiffusionTrainer:
             cate_counts = defaultdict(int)
             for s in self.train_ds.samples:
                 cate_counts[s["cate_id"]] += 1
-            weights = [1.0 / cate_counts[s["cate_id"]] for s in self.train_ds.samples]
+            weights = [
+                1.0 / math.sqrt(cate_counts[s["cate_id"]])
+                for s in self.train_ds.samples
+            ]
             sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
             shuffle = False
-            self.logger.info(f"Balanced sampling: {len(cate_counts)} categories")
+            self.logger.info(
+                f"Balanced sampling: sqrt-inverse over {len(cate_counts)} categories"
+            )
 
         self.train_dl = DataLoader(
             self.train_ds,
@@ -619,6 +624,11 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--seed", type=int, default=7725)
+    p.add_argument(
+        "--balanced_sampling",
+        action="store_true",
+        help="使用 1/sqrt(category_count) 的弱类别均衡采样",
+    )
 
     p.add_argument("--vocab_size", type=int, default=26)
     p.add_argument("--pad_token_id", type=int, default=24)
@@ -646,6 +656,7 @@ def main():
         lr=args.lr,
         resume=args.resume,
         seed=args.seed,
+        balanced_sampling=args.balanced_sampling,
         vocab_size=args.vocab_size,
         pad_token_id=args.pad_token_id,
         mask_token_id=args.mask_token_id,

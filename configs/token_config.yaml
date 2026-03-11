@@ -1,0 +1,208 @@
+# ==============================================================================
+# Simplified Token Configuration for Contact-Semantic Discrete Diffusion
+# ==============================================================================
+# 简化版：
+# 离散 token = (hand_part, canonical_slot)
+# - 保留 hand part 细粒度语义
+# - 压缩物体 slot
+# - 移除 contact_type，降低稀疏性与预处理复杂度
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Hand Part 定义
+# ------------------------------------------------------------------------------
+# 来源：MANO mesh 顶点分组，共 778 个顶点
+# 分组方式：基于 MANO 骨骼绑定权重，每个顶点归属权重最大的手指/掌心
+# ------------------------------------------------------------------------------
+hand_parts:
+  labels:
+    - THUMB          # 0 - 拇指
+    - INDEX          # 1 - 食指
+    - MIDDLE         # 2 - 中指
+    - RING           # 3 - 无名指
+    - LITTLE         # 4 - 小指
+    - PALM           # 5 - 掌心
+  num: 6
+
+  # MANO 关节索引 → hand_part 映射
+  # MANO 有 16 个关节 (0=wrist, 1-3=index, 4-6=middle, 7-9=little, 10-12=ring, 13-15=thumb)
+  joint_to_part:
+    0: PALM
+    1: INDEX
+    2: INDEX
+    3: INDEX
+    4: MIDDLE
+    5: MIDDLE
+    6: MIDDLE
+    7: LITTLE
+    8: LITTLE
+    9: LITTLE
+    10: RING
+    11: RING
+    12: RING
+    13: THUMB
+    14: THUMB
+    15: THUMB
+
+# ------------------------------------------------------------------------------
+# 2. Canonical Slot 定义（简化为 4 类）
+# ------------------------------------------------------------------------------
+# 合并策略：
+# - BODY + HANDLE -> GRASP_SURFACE
+# - HEAD + EMITTER -> FUNCTIONAL_END
+# - TRIGGER_CONTROL -> CONTROL
+# - CAP_LID -> CLOSURE
+# ------------------------------------------------------------------------------
+canonical_slots:
+  labels:
+    - GRASP_SURFACE   # 0 - 主握持面：主体 / 手柄 / 杆状抓取区域
+    - FUNCTIONAL_END  # 1 - 功能端：工具头 / 喷嘴 / 镜头 / 壶嘴 / 输出端
+    - CONTROL         # 2 - 控制件：扳机 / 按钮 / 控制面板
+    - CLOSURE         # 3 - 封闭件：盖子 / 盖帽 / 封口部件
+  num: 4
+
+# ------------------------------------------------------------------------------
+# 3. OakInk part name 归一化与槽位映射
+# ------------------------------------------------------------------------------
+# 说明：
+# - 先把原始 part 名称归一化到 normalized_name
+# - 再把 normalized_name 映射到简化后的 canonical slot
+# - 这里保留你原来 schema 的主要兼容项，但最终只落到 4 个 slot
+# ------------------------------------------------------------------------------
+name_normalization:
+  raw_to_normalized:
+    # -------------------------
+    # -> grasp_surface
+    # -------------------------
+    body: grasp_surface
+    bowl: grasp_surface       # wineglass_bowl, etc.
+    main_body: grasp_surface
+    container: grasp_surface
+    surface: grasp_surface
+    side_wall: grasp_surface
+    handle: grasp_surface
+    grip: grasp_surface
+    shaft: grasp_surface
+    stem: grasp_surface
+    rod: grasp_surface
+    barrel: grasp_surface
+    frame: grasp_surface
+    housing: grasp_surface
+    support: grasp_surface
+
+    # 原低频 wearable / structural 合并到 grasp_surface
+    headband: grasp_surface
+    ear_cap: grasp_surface
+    left_ear_cap: grasp_surface
+    right_ear_cap: grasp_surface
+    eyepiece: grasp_surface
+    battery: grasp_surface
+    motor: grasp_surface
+    connector: grasp_surface
+    base: grasp_surface
+    
+    # 眼镜腿（template_bar 是 OakInk 原始数据中的命名）
+    left_template_bar: grasp_surface
+    right_template_bar: grasp_surface
+    
+    # handle 复数形式
+    handles: grasp_surface
+
+    # -------------------------
+    # -> functional_end
+    # -------------------------
+    head: functional_end
+    blade: functional_end
+    blades: functional_end
+    brush_head: functional_end
+    tip: functional_end
+    bit: functional_end              # drill_bit 钻头
+    jaws: functional_end             # pincer_jaws 钳口
+    chuck: functional_end            # drill_chuck 钻夹头
+    nozzle: functional_end
+    spout: functional_end
+    bulb: functional_end
+    bulb_and_reflector: functional_end
+    len: functional_end              # camera_len，原数据拼写
+    lens_and_bridge: functional_end
+    objective_lens: functional_end
+    pump_head: functional_end
+    emitter: functional_end
+
+    # -------------------------
+    # -> control
+    # -------------------------
+    trigger: control
+    control_buttons: control
+    grip_and_control_panel: control
+    grip_and_control_pannel: control   # 原数据拼写
+    pannel: control                    # 原数据拼写
+
+    # -------------------------
+    # -> closure
+    # -------------------------
+    cap: closure
+    lid: closure
+    cap_lid: closure
+    closure: closure
+
+  normalized_to_slot:
+    grasp_surface: GRASP_SURFACE
+    functional_end: FUNCTIONAL_END
+    control: CONTROL
+    closure: CLOSURE
+
+# ------------------------------------------------------------------------------
+# 4. Token 空间定义
+# ------------------------------------------------------------------------------
+# token_id = hand_part_id * num_slots + slot_id
+# ------------------------------------------------------------------------------
+token_space:
+  # 有效 token 数量 = 6 hand × 4 slot = 24
+  num_semantic_tokens: 24
+
+  # 特殊 token
+  special_tokens:
+    PAD: 24                # padding token
+    MASK: 25               # absorbing diffusion 的 mask token
+
+  # 总词表大小
+  vocab_size: 26
+
+  # 每个 grasp 的最大 token 数量
+  # 理论上限 = 6 hand_part × 4 slot = 24
+  # 实际一般远小于理论上限，通常 3-8 个有效 token，设 12 留余量
+  max_token_length: 12
+
+# ------------------------------------------------------------------------------
+# 5. Token ID 编解码参数
+# ------------------------------------------------------------------------------
+encoding:
+  hand_part_stride: 4      # num_slots
+
+  # 解码示例:
+  # token_id = 9
+  # hand_part_id = 9 // 4 = 2  -> MIDDLE
+  # slot_id      = 9 %  4 = 1  -> FUNCTIONAL_END
+  # -> (MIDDLE, FUNCTIONAL_END)
+
+# ------------------------------------------------------------------------------
+# 6. 数据预处理参数
+# ------------------------------------------------------------------------------
+preprocessing:
+  oakink_root: "/home/kingston/wzc/data/OakInk"
+  cache_dir: "./cache/contact_tokens"
+
+  # 类别均衡采样：每个物体类别的采样权重 = 1 / 该类别样本数
+  balanced_sampling: true
+
+  # 是否缓存接触矩阵
+  cache_contact_matrix: true
+
+  # 接触判定：这里只保留“是否接触”的阈值
+  # 不再细分 POINT / AREA / WRAP
+  contact_thresholds:
+    contact_distance: 5.0
+  # 注意：contact_distance 单位是毫米 (mm)，默认 5mm = 0.005m
+  # 该阈值适用于 OakInk 数据集的典型家用物品尺度（与 MANO 手部模型同坐标系）
+  # 数据集中的物体和手部都经过 bbox 中心化，但保持原始尺度（米级坐标系）

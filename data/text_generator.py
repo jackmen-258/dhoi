@@ -1,17 +1,17 @@
 """
-text_generator.py (v6 – 极简确定性映射)
-========================================
-生成稳定的自然语言描述（单个句子），用于 CLIP 编码。
+text_generator.py (v7 - deterministic natural prompts)
+======================================================
+生成稳定、自然、可用于 CLIP 编码的单句文本描述。
 
 设计原则：
-  - 完全确定性：相同接触模式 → 相同文本 → 相同 CLIP embedding
-  - 极简：仅编码 object + 哪些手指接触哪些部件
-  - contact_type 不在文本中体现 (已由 token 序列携带)
-  - intent 统一为 grasp (具体意图由 token 序列携带)
+  - 完全确定性：相同输入始终生成相同文本
+  - 更自然：尽量贴近图文预训练模型常见的 caption 风格
+  - 轻量语义：编码 object + intent + hand-slot contact
+  - schema-aware：slot 仍是 canonical slot，但会映射到更自然的物体部件词汇
 
 生成规则：
-  - 格式: "To grasp the {obj}, {fingers} on the {slot1} and {fingers} on the {slot2}."
-  - 无接触时: "No contact with the {obj}."
+  - 格式: "A hand {intent_phrase} the {obj}, with {fingers} on the {part_phrase}."
+  - 无接触时: "A hand {intent_phrase} the {obj}, without visible contact."
 """
 
 import os
@@ -33,12 +33,12 @@ HAND_NAME = {
     "PALM":   "palm",
 }
 
-# ---- 物体部件 → 自然语言 ----
-SLOT_NAME = {
-    "GRASP_SURFACE":   "grasp surface",
-    "FUNCTIONAL_END":  "functional end",
-    "CONTROL":         "control",
-    "CLOSURE":         "closure",
+# ---- 默认 slot → 自然语言 ----
+DEFAULT_SLOT_NAME = {
+    "GRASP_SURFACE": "body or handle",
+    "FUNCTIONAL_END": "functional end",
+    "CONTROL": "control area",
+    "CLOSURE": "cap or lid",
 }
 
 # ---- OakInk cate_id → 自然语言物体名 ----
@@ -46,6 +46,7 @@ CATE_TO_NAME = {
     "bottle":           "bottle",
     "cylinder_bottle":  "bottle",
     "lotion_bottle":    "bottle",
+    "lotion_pump":      "lotion pump bottle",
     "bowl":             "bowl",
     "camera":           "camera",
     "cameras":          "camera",
@@ -80,6 +81,107 @@ CATE_TO_NAME = {
     "binoculars":       "binoculars",
 }
 
+# ---- 动作意图 → 句式短语 ----
+ACTION_TO_PHRASE = {
+    "0001": "using",
+    "0002": "holding",
+    "0003": "lifting",
+    "0004": "handing over",
+}
+
+# ---- 类别特定 slot 用词 ----
+SLOT_NAME_BY_CATEGORY = {
+    "bottle": {
+        "GRASP_SURFACE": "bottle body",
+        "FUNCTIONAL_END": "opening",
+        "CLOSURE": "cap",
+    },
+    "cylinder_bottle": {
+        "GRASP_SURFACE": "bottle body",
+        "FUNCTIONAL_END": "opening",
+        "CLOSURE": "cap",
+    },
+    "lotion_pump": {
+        "GRASP_SURFACE": "bottle body",
+        "FUNCTIONAL_END": "pump head",
+        "CONTROL": "pump top",
+    },
+    "mug": {
+        "GRASP_SURFACE": "mug body or handle",
+    },
+    "cup": {
+        "GRASP_SURFACE": "cup body",
+    },
+    "bowl": {
+        "GRASP_SURFACE": "rim or outer surface",
+    },
+    "wineglass": {
+        "GRASP_SURFACE": "stem or bowl",
+        "FUNCTIONAL_END": "rim",
+    },
+    "knife": {
+        "GRASP_SURFACE": "handle",
+        "FUNCTIONAL_END": "blade",
+    },
+    "hammer": {
+        "GRASP_SURFACE": "handle",
+        "FUNCTIONAL_END": "hammer head",
+    },
+    "pen": {
+        "GRASP_SURFACE": "barrel",
+        "FUNCTIONAL_END": "tip",
+        "CLOSURE": "cap",
+    },
+    "flashlight": {
+        "GRASP_SURFACE": "flashlight body",
+        "FUNCTIONAL_END": "light end",
+        "CONTROL": "button",
+    },
+    "cameras": {
+        "GRASP_SURFACE": "camera body or grip",
+        "FUNCTIONAL_END": "lens",
+        "CONTROL": "button or control panel",
+    },
+    "eyeglasses": {
+        "GRASP_SURFACE": "frame or temple",
+        "FUNCTIONAL_END": "lens area",
+    },
+    "headphones": {
+        "GRASP_SURFACE": "headband or ear cup",
+    },
+    "power_drill": {
+        "GRASP_SURFACE": "handle",
+        "FUNCTIONAL_END": "drill bit or chuck",
+        "CONTROL": "trigger",
+    },
+    "trigger_sprayer": {
+        "GRASP_SURFACE": "bottle body or handle",
+        "FUNCTIONAL_END": "nozzle",
+        "CONTROL": "trigger",
+    },
+    "teapot": {
+        "GRASP_SURFACE": "handle or body",
+        "FUNCTIONAL_END": "spout",
+        "CLOSURE": "lid",
+    },
+    "toothbrush": {
+        "GRASP_SURFACE": "handle",
+        "FUNCTIONAL_END": "brush head",
+    },
+    "stapler": {
+        "GRASP_SURFACE": "top surface",
+        "FUNCTIONAL_END": "front end",
+    },
+    "mouse": {
+        "GRASP_SURFACE": "mouse body",
+        "CONTROL": "button area",
+    },
+    "binoculars": {
+        "GRASP_SURFACE": "barrel",
+        "FUNCTIONAL_END": "lens end",
+    },
+}
+
 # 手指生理顺序
 HAND_ORDER = {h: i for i, h in enumerate(
     ["THUMB", "INDEX", "MIDDLE", "RING", "LITTLE", "PALM"])}
@@ -87,10 +189,12 @@ HAND_ORDER = {h: i for i, h in enumerate(
 
 class ContactTextGenerator:
     """
-    接触矩阵 → 自然语言描述 (完全确定性, 无随机)
+    接触矩阵 → 自然语言描述（完全确定性，无随机）
 
-    文本仅编码: object + 哪些手指接触哪些部件
-    contact_type / intent 不在文本中体现 (已由 token 序列携带)
+    文本编码：
+      - object category
+      - action intent
+      - 哪些手部部位接触哪些 canonical slot
     """
 
     def __init__(self, mapper: SlotMapper, seed: Optional[int] = None):
@@ -110,8 +214,17 @@ class ContactTextGenerator:
             return f"{items[0]} and {items[1]}"
         return ", ".join(items[:-1]) + f", and {items[-1]}"
 
+    @staticmethod
+    def _intent_phrase(action_id: str) -> str:
+        return ACTION_TO_PHRASE.get(str(action_id), "grasping")
+
+    def _slot_phrase(self, cate_id: str, slot_name: str) -> str:
+        cate_key = cate_id.lower().strip()
+        cate_map = SLOT_NAME_BY_CATEGORY.get(cate_key, {})
+        return cate_map.get(slot_name, DEFAULT_SLOT_NAME.get(slot_name, slot_name.lower()))
+
     def _format_hand_parts(self, hps: List[str]) -> str:
-        """智能化简手部组合"""
+        """将 hand parts 转成较自然的英文短语"""
         has_palm = "PALM" in hps
         finger_keys = ["THUMB", "INDEX", "MIDDLE", "RING", "LITTLE"]
         fingers = [h for h in finger_keys if h in hps]
@@ -140,19 +253,19 @@ class ContactTextGenerator:
                     fingers_str = f"the thumb and {HAND_NAME[non_thumb[0]]} finger"
                 else:
                     others = [HAND_NAME[f] for f in non_thumb]
-                    others_str = ", ".join(others[:-1]) + f", and {others[-1]}" if len(others) > 2 else f"{others[0]} and {others[1]}"
+                    others_str = self._join_list(others)
                     fingers_str = f"the thumb, {others_str} fingers"
             else:
                 names = [HAND_NAME[f] for f in fingers]
                 if len(names) == 2:
                     fingers_str = f"the {names[0]} and {names[1]} fingers"
                 else:
-                    fingers_str = "the " + ", ".join(names[:-1]) + f", and {names[-1]} fingers"
+                    fingers_str = "the " + self._join_list(names) + " fingers"
 
         if has_palm:
             if not fingers_str:
                 return "the palm"
-            return f"{fingers_str} and palm"
+            return f"{fingers_str} and the palm"
 
         if not fingers_str:
             return "the hand"
@@ -177,7 +290,8 @@ class ContactTextGenerator:
                         self.mapper.hand_parts[h],
                         self.mapper.canonical_slots[s],
                     ))
-        contacts.sort(key=lambda x: (x[1], HAND_ORDER.get(x[0], 99)))
+        slot_order = {s: i for i, s in enumerate(self.mapper.canonical_slots)}
+        contacts.sort(key=lambda x: (slot_order.get(x[1], 99), HAND_ORDER.get(x[0], 99)))
         return contacts
 
     def _group_by_slot(self, contacts):
@@ -193,19 +307,22 @@ class ContactTextGenerator:
                 slot_data[sl].append(hp)
         return slot_data
 
-    def _build_sentence(self, contacts, obj_name: str) -> str:
+    def _build_sentence(self, contacts, cate_id: str, obj_name: str, action_id: str) -> str:
         """
-        生成极简句子
-        格式: "To grasp the {obj}, {fingers} on the {slot1} and {fingers} on the {slot2}."
+        生成自然、确定性的 caption 风格句子
         """
+        intent_phrase = self._intent_phrase(action_id)
         slot_groups = self._group_by_slot(contacts)
         if not slot_groups:
-            return f"No contact with the {obj_name}."
+            return f"A hand {intent_phrase} the {obj_name}, without visible contact."
 
         clauses = []
-        for sl, hands in slot_groups.items():
+        for sl in self.mapper.canonical_slots:
+            hands = slot_groups.get(sl)
+            if not hands:
+                continue
             hand_str = self._format_hand_parts(hands)
-            slot_str = SLOT_NAME.get(sl, sl.lower())
+            slot_str = self._slot_phrase(cate_id, sl)
             clauses.append(f"{hand_str} on the {slot_str}")
 
         if len(clauses) == 1:
@@ -213,9 +330,9 @@ class ContactTextGenerator:
         elif len(clauses) == 2:
             body = f"{clauses[0]} and {clauses[1]}"
         else:
-            body = ", ".join(clauses[:-1]) + f", and {clauses[-1]}"
+            body = self._join_list(clauses)
 
-        return f"To grasp the {obj_name}, {body}."
+        return f"A hand {intent_phrase} the {obj_name}, with {body}."
 
     # ==================================================================
     # 公共接口
@@ -233,14 +350,14 @@ class ContactTextGenerator:
         Args:
             contact_matrix: (6, 4) 接触矩阵, -1=无接触, 0=接触
             cate_id: 物体类别 ID
-            action_id: OakInk action ID (已忽略)
+            action_id: OakInk action ID
 
         Returns:
             自然语言描述字符串
         """
         contacts = self._parse(contact_matrix)
         obj_name = self._obj_name(cate_id)
-        return self._build_sentence(contacts, obj_name)
+        return self._build_sentence(contacts, cate_id, obj_name, action_id)
 
     def generate(
         self,

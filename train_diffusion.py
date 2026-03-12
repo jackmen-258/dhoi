@@ -60,7 +60,7 @@ class TrainConfig:
     pad_token_id:  int = 24
     mask_token_id: int = 25
     min_tokens:    int = 1
-    pad_logit_bias: float = -4.0
+    pad_logit_bias: float = 0.0
 
     # ---- training ----
     epochs:            int   = 100
@@ -364,7 +364,9 @@ class DiffusionTrainer:
         self.logger.info(f"  Timesteps:    {cfg.num_timesteps}")
         self.logger.info(f"  Vocab:        {cfg.vocab_size}  PAD={cfg.pad_token_id}  MASK={cfg.mask_token_id}")
         self.logger.info(f"  Text:         {'CLIP ' + cfg.clip_model if cfg.use_text else 'off'}  cond_drop={cfg.cond_dropout}")
-        self.logger.info(f"  Sample rule:  min_tokens={cfg.min_tokens}  pad_logit_bias={cfg.pad_logit_bias}")
+        self.logger.info(
+            f"  Sample rule:  min_tokens={cfg.min_tokens}  pad_logit_bias={cfg.pad_logit_bias}"
+        )
         self.logger.info(f"  Train:        {len(self.train_ds)} samples, {len(self.train_dl)} steps/epoch")
         self.logger.info(f"  AMP:          {cfg.use_amp}")
         self.logger.info("=" * 60)
@@ -428,7 +430,9 @@ class DiffusionTrainer:
                     f"loss={log.get('loss', 0):.4f}",
                     f"mask={log.get('loss_mask_only', 0):.4f}",
                     f"ratio={log.get('mask_ratio', 0):.3f}",
-                    f"acc={log.get('semantic_acc_masked', 0):.3f}",
+                    f"acc={log.get('masked_acc', 0):.3f}",
+                    f"sem_acc={log.get('semantic_acc_masked', 0):.3f}",
+                    f"pad_acc={log.get('pad_acc_masked', 0):.3f}",
                     f"lr={lr:.2e}",
                 ]
                 self.logger.info("  ".join(parts))
@@ -560,10 +564,13 @@ class DiffusionTrainer:
             gt_toks = [int(t) for t in gt[i]]
             pred_toks = [int(t) for t in samples[i]]
             gt_sem = sum(1 for t in gt_toks if mapper.is_semantic_token(t))
+            gt_pad = sum(1 for t in gt_toks if t == cfg.pad_token_id)
             pred_sem = sum(1 for t in pred_toks if mapper.is_semantic_token(t))
             pred_pad = sum(1 for t in pred_toks if t == cfg.pad_token_id)
-            self.logger.info(f"  [{i}] GT:   {gt_toks}  (sem={gt_sem})")
-            self.logger.info(f"  [{i}] Pred: {pred_toks}  (sem={pred_sem}, pad={pred_pad})")
+            self.logger.info(f"  [{i}] GT:   {gt_toks}  (sem={gt_sem}, pad={gt_pad})")
+            self.logger.info(
+                f"  [{i}] Pred: {pred_toks}  (sem={pred_sem}, pad={pred_pad})"
+            )
 
     def _save_checkpoint(self, filename):
         path = os.path.join(self.cfg.save_dir, filename)
@@ -634,7 +641,7 @@ def parse_args():
     p.add_argument("--pad_token_id", type=int, default=24)
     p.add_argument("--mask_token_id", type=int, default=25)
     p.add_argument("--min_tokens", type=int, default=1)
-    p.add_argument("--pad_logit_bias", type=float, default=-4.0)
+    p.add_argument("--pad_logit_bias", type=float, default=0.0)
 
     return p.parse_args()
 

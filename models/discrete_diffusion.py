@@ -65,24 +65,20 @@ class AbsorbingDiffusion(nn.Module):
 
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
         """
-        仅对有效 token 位做 absorbing corruption；PAD 位固定保持 PAD。
+        对 x_0 中的所有位置做 absorbing corruption，包括尾部 PAD 位。
+
+        这样模型在训练时也会看到 “MASK -> PAD” 的恢复任务，
+        否则采样阶段从全 MASK 开始时，模型学不会何时终止序列。
 
         Args:
             x_0: (B, L)
             t:   (B,)
-            token_mask: (B, L) bool，True 表示有效 semantic 位
+            token_mask: 保留兼容接口，当前不参与 corruption 决策
         """
         B, L = x_0.shape
         ab = self.alpha_bar[t].unsqueeze(1).expand(B, L)
         keep = torch.rand(B, L, device=x_0.device) < ab
         x_t = torch.where(keep, x_0, self.mask_token_id)
-
-        if token_mask is not None:
-            token_mask = token_mask.bool()
-            x_t = torch.where(token_mask, x_t, torch.full_like(x_t, self.pad_token_id))
-        else:
-            non_pad = (x_0 != self.pad_token_id)
-            x_t = torch.where(non_pad, x_t, torch.full_like(x_t, self.pad_token_id))
         return x_t
 
     def q_posterior(self, x_0, x_t, t):
@@ -104,13 +100,14 @@ class AbsorbingDiffusion(nn.Module):
         if token_mask is None:
             token_mask = (x_0 != self.pad_token_id)
         token_mask = token_mask.bool()
+        pad_mask = ~token_mask
 
         t = torch.randint(1, self.num_timesteps + 1, (B,), device=device)
         x_t = self.q_sample(x_0, t, token_mask=token_mask)
         logits = model(x_t, t, cond)  # (B, L, V)
 
         is_masked = (x_t == self.mask_token_id)
-        supervise_mask = is_masked & token_mask
+        supervise_mask = is_masked
 
         flat_logits = logits.reshape(-1, self.vocab_size)
         flat_targets = x_0.reshape(-1)
@@ -122,16 +119,35 @@ class AbsorbingDiffusion(nn.Module):
         loss = (ce * supervise_mask.float()).sum() / n_supervised
 
         with torch.no_grad():
+            masked_acc = torch.tensor(0.0, device=device)
             semantic_acc = torch.tensor(0.0, device=device)
+            pad_acc = torch.tensor(0.0, device=device)
+            semantic_supervise_mask = supervise_mask & token_mask
+            pad_supervise_mask = supervise_mask & pad_mask
+
             if supervise_mask.any():
                 pred = logits.argmax(dim=-1)
-                semantic_acc = (pred[supervise_mask] == x_0[supervise_mask]).float().mean()
+                masked_acc = (pred[supervise_mask] == x_0[supervise_mask]).float().mean()
+            if semantic_supervise_mask.any():
+                pred = logits.argmax(dim=-1)
+                semantic_acc = (
+                    pred[semantic_supervise_mask] == x_0[semantic_supervise_mask]
+                ).float().mean()
+            if pad_supervise_mask.any():
+                pred = logits.argmax(dim=-1)
+                pad_acc = (
+                    pred[pad_supervise_mask] == x_0[pad_supervise_mask]
+                ).float().mean()
 
         return {
             "loss": loss,
             "loss_mask_only": loss,
             "mask_ratio": supervise_mask.float().mean(),
+            "semantic_mask_ratio": semantic_supervise_mask.float().mean(),
+            "pad_mask_ratio": pad_supervise_mask.float().mean(),
+            "masked_acc": masked_acc,
             "semantic_acc_masked": semantic_acc,
+            "pad_acc_masked": pad_acc,
         }
 
     @torch.no_grad()

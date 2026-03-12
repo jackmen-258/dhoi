@@ -47,6 +47,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 
 from data.token_encoder import TokenEncoder
+from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.pose_decoder import build_pose_model
 from models.refine import RefineNet, build_refine_net, point2point_signed
@@ -405,7 +406,8 @@ class Trainer:
     def _encode_obj(self, batch):
         obj_pc = batch["obj_pc"].to(self.device)
         obj_vn = batch["obj_vn"].to(self.device)
-        obj_in = torch.cat([obj_pc, obj_vn], dim=-1)
+        obj_pc_norm, _ = normalize_object_points(obj_pc)
+        obj_in = torch.cat([obj_pc_norm, obj_vn], dim=-1)
         with torch.no_grad():
             obj_global_feat, obj_point_feat, obj_point_xyz = self.obj_enc(obj_in)
         return obj_global_feat, obj_point_feat, obj_point_xyz

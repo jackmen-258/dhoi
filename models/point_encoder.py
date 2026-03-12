@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
+from models.object_normalization import compute_object_scale, normalize_object_points
 from models.pointnet2 import PointNetSetAbstraction
-
 
 class PointNet2Encoder(nn.Module):
     """
@@ -11,7 +11,8 @@ class PointNet2Encoder(nn.Module):
 
     输出：
       global_feat:  (B, global_dim)
-      point_feat:   (B, 128, point_dim)
+      point_feat:   (B, 128, point_dim)  - SA2 geometry tokens
+      point_xyz:    (B, 128, 3)          - SA2 token coordinates
     """
 
     def __init__(
@@ -73,7 +74,7 @@ class PointNet2Encoder(nn.Module):
 
     def forward(
         self, point_cloud: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             point_cloud: (B, N, in_dim)
@@ -81,6 +82,7 @@ class PointNet2Encoder(nn.Module):
         Returns:
             global_feat: (B, global_dim)
             point_feat:  (B, 128, point_dim)
+            point_xyz:   (B, 128, 3)
         """
         x = point_cloud.permute(0, 2, 1)       # (B, D, N)
 

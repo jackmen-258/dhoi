@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from models.object_normalization import normalize_object_points
 from utils.pose_utils import rot6d_to_aa
 
 
@@ -103,9 +104,10 @@ class ConditionEncoder(nn.Module):
     """
     Condition encoder for simplified (hand_part, slot) tokens.
 
-    Main change:
-      - remove contact_type and slot_geo_feat route
-      - inject slot_labels as point-level slot embedding into spatial branch
+    Conditioning layout:
+      - 128 SA2 points provide geometry tokens
+      - original dense slot labels provide 4 slot summary tokens
+      - slot labels are no longer forced to align with SA2 points one-by-one
     """
 
     def __init__(
@@ -142,16 +144,23 @@ class ConditionEncoder(nn.Module):
         nn.init.zeros_(self.obj_to_scale_shift[-1].weight)
         nn.init.zeros_(self.obj_to_scale_shift[-1].bias)
 
-        # point-level slot conditioning
-        self.slot_point_emb_dim = int(slot_point_emb_dim)
-        self.slot_point_emb = nn.Embedding(num_slots + 1, self.slot_point_emb_dim)
-
-        spatial_in_dim = obj_point_dim + obj_xyz_dim + self.slot_point_emb_dim
+        # SA2 geometry tokens stay point-wise.
+        spatial_in_dim = obj_point_dim + obj_xyz_dim
         self.use_spatial = spatial_in_dim > 0
         if self.use_spatial:
             self.spatial_proj = nn.Sequential(
                 nn.Linear(spatial_in_dim, D), nn.SiLU(), nn.Linear(D, D)
             )
+
+        # Dense slot labels are summarized into one token per slot.
+        self.slot_token_emb_dim = int(slot_point_emb_dim)
+        self.slot_token_emb = nn.Embedding(num_slots, D)
+        self.slot_stat_dim = obj_xyz_dim * 2 + 2  # centroid, spread, ratio, present
+        self.slot_stat_proj = nn.Sequential(
+            nn.Linear(self.slot_stat_dim, D),
+            nn.SiLU(),
+            nn.Linear(D, D),
+        )
 
         self.blocks = nn.ModuleList([
             ConditionBlock(D, num_heads, dropout=dropout, use_spatial=self.use_spatial)
@@ -177,27 +186,96 @@ class ConditionEncoder(nn.Module):
     def _init_weights(self):
         nn.init.normal_(self.hand_part_emb.weight, std=0.02)
         nn.init.normal_(self.slot_emb.weight, std=0.02)
-        nn.init.normal_(self.slot_point_emb.weight, std=0.02)
+        nn.init.normal_(self.slot_token_emb.weight, std=0.02)
 
-    def _embed_slot_labels(self, slot_labels: torch.Tensor | None,
-                           B: int, N: int, device: torch.device) -> torch.Tensor:
-        if slot_labels is None:
-            ids = torch.full((B, N), self.unknown_slot_id, dtype=torch.long, device=device)
-        else:
-            ids = slot_labels.to(device=device, dtype=torch.long)
-            ids = torch.where(
-                (ids >= 0) & (ids < self.num_slots),
-                ids,
-                torch.full_like(ids, self.unknown_slot_id),
+    def _build_slot_tokens(
+        self,
+        slot_labels: torch.Tensor | None,
+        obj_pc: torch.Tensor | None,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if obj_pc is None:
+            batch_size = slot_labels.shape[0] if slot_labels is not None else 1
+            xyz = torch.zeros(
+                batch_size, 1, 3, device=device, dtype=self.slot_token_emb.weight.dtype
             )
-        return self.slot_point_emb(ids)
+            labels = None
+            obj_scale = torch.ones(batch_size, 1, device=device, dtype=xyz.dtype)
+        else:
+            xyz = obj_pc.to(device=device, dtype=self.slot_token_emb.weight.dtype)
+            xyz, obj_scale = normalize_object_points(xyz)
+            batch_size = xyz.shape[0]
+            labels = slot_labels.to(device=device, dtype=torch.long) if slot_labels is not None else None
+
+        slot_ids = torch.arange(self.num_slots, device=device, dtype=torch.long)
+        slot_base = self.slot_token_emb(slot_ids).unsqueeze(0).expand(batch_size, -1, -1)
+
+        stats = torch.zeros(
+            batch_size, self.num_slots, self.slot_stat_dim,
+            device=device, dtype=slot_base.dtype,
+        )
+        slot_centroids = torch.zeros(
+            batch_size, self.num_slots, 3,
+            device=device, dtype=slot_base.dtype,
+        )
+        slot_present = torch.zeros(
+            batch_size, self.num_slots,
+            device=device, dtype=slot_base.dtype,
+        )
+        if labels is None or obj_pc is None:
+            return slot_base + self.slot_stat_proj(stats), slot_centroids, slot_present, obj_scale
+
+        valid = (labels >= 0) & (labels < self.num_slots)
+        slot_masks = torch.stack([(labels == s) & valid for s in range(self.num_slots)], dim=-1)
+        slot_masks = slot_masks.to(dtype=xyz.dtype)
+
+        counts = slot_masks.sum(dim=1)  # (B, S)
+        denom = counts.clamp(min=1.0).unsqueeze(-1)
+
+        centroid = torch.einsum("bns,bnd->bsd", slot_masks, xyz) / denom
+        diff = (xyz.unsqueeze(2) - centroid.unsqueeze(1)).abs()
+        spread = (diff * slot_masks.unsqueeze(-1)).sum(dim=1) / denom
+
+        num_points = max(xyz.shape[1], 1)
+        ratio = counts / float(num_points)
+        present = (counts > 0).to(dtype=xyz.dtype)
+        stats = torch.cat(
+            [centroid, spread, ratio.unsqueeze(-1), present.unsqueeze(-1)],
+            dim=-1,
+        )
+        return slot_base + self.slot_stat_proj(stats), centroid, present, obj_scale
+
+    def _build_trans_anchor(
+        self,
+        token_slots: torch.Tensor,
+        token_mask: torch.Tensor,
+        slot_centroids: torch.Tensor,
+        slot_present: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_slots = (
+            token_mask
+            & (token_slots >= 0)
+            & (token_slots < self.num_slots)
+        )
+        slot_ids = token_slots.clamp(min=0, max=self.num_slots - 1)
+        slot_weights = F.one_hot(slot_ids, num_classes=self.num_slots).to(slot_centroids.dtype)
+        slot_weights = slot_weights * valid_slots.unsqueeze(-1)
+        slot_weights = slot_weights.sum(dim=1)
+        slot_weights = slot_weights * slot_present
+
+        fallback = slot_present
+        has_weight = slot_weights.sum(dim=-1, keepdim=True) > 0
+        slot_weights = torch.where(has_weight, slot_weights, fallback)
+        denom = slot_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        return torch.einsum("bs,bsd->bd", slot_weights, slot_centroids) / denom
 
     def forward(self, contact_tokens: torch.Tensor, token_mask: torch.Tensor,
                 obj_global_feat: torch.Tensor,
                 obj_point_feat: torch.Tensor | None = None,
                 obj_point_xyz: torch.Tensor | None = None,
                 slot_labels: torch.Tensor | None = None,
-                slot_geo_feat: torch.Tensor | None = None):
+                slot_geo_feat: torch.Tensor | None = None,
+                obj_pc: torch.Tensor | None = None):
         del slot_geo_feat  # kept only for backward-compatible call signatures
 
         B, L = contact_tokens.shape
@@ -212,7 +290,7 @@ class ConditionEncoder(nn.Module):
         scale, shift = self.obj_to_scale_shift(obj_global_feat).chunk(2, dim=-1)
         h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        spatial_kv = None
+        geometry_tokens = None
         spatial_summary = c_global
         if self.use_spatial and (obj_point_feat is not None or obj_point_xyz is not None):
             if obj_point_feat is None:
@@ -222,11 +300,25 @@ class ConditionEncoder(nn.Module):
                     obj_point_feat.shape[0], obj_point_feat.shape[1], 3
                 )
 
-            N = obj_point_feat.shape[1]
-            slot_feat = self._embed_slot_labels(slot_labels, B, N, obj_point_feat.device)
-            spatial_in = torch.cat([obj_point_feat, obj_point_xyz, slot_feat], dim=-1)
-            spatial_kv = self.spatial_proj(spatial_in)
-            spatial_summary = spatial_kv.mean(dim=1)
+            spatial_in = torch.cat([obj_point_feat, obj_point_xyz], dim=-1)
+            geometry_tokens = self.spatial_proj(spatial_in)
+
+        slot_tokens, slot_centroids, slot_present, obj_scale = self._build_slot_tokens(
+            slot_labels, obj_pc, obj_global_feat.device
+        )
+        trans_anchor = self._build_trans_anchor(sl, token_mask, slot_centroids, slot_present)
+
+        cond_kv_parts = []
+        summary_parts = []
+        if geometry_tokens is not None:
+            cond_kv_parts.append(geometry_tokens)
+            summary_parts.append(geometry_tokens.mean(dim=1))
+        if slot_tokens is not None:
+            cond_kv_parts.append(slot_tokens)
+            summary_parts.append(slot_tokens.mean(dim=1))
+        spatial_kv = torch.cat(cond_kv_parts, dim=1) if cond_kv_parts else None
+        if summary_parts:
+            spatial_summary = torch.stack(summary_parts, dim=1).mean(dim=1)
 
         pad_mask = ~token_mask
         for blk in self.blocks:
@@ -240,6 +332,11 @@ class ConditionEncoder(nn.Module):
             "token_parts": hp,
             "token_slots": sl,
             "spatial_summary": spatial_summary,
+            "slot_tokens": slot_tokens,
+            "slot_centroids": slot_centroids,
+            "slot_present": slot_present,
+            "trans_anchor": trans_anchor,
+            "obj_scale": obj_scale,
             "obj_point_xyz": obj_point_xyz,
         }
 
@@ -389,13 +486,13 @@ class PoseHead(nn.Module):
 
 
 class TransHead(nn.Module):
-    """Predict hand translation from global / token / point summaries."""
+    """Predict normalized residual translation on top of an object anchor."""
 
     def __init__(self, hidden_dim: int = 512, dropout: float = 0.1):
         super().__init__()
         D = hidden_dim
         self.net = nn.Sequential(
-            nn.Linear(D * 3, D), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(D * 3 + TRANS_DIM, D), nn.SiLU(), nn.Dropout(dropout),
             nn.Linear(D, D // 2), nn.SiLU(), nn.Dropout(dropout),
             nn.Linear(D // 2, TRANS_DIM),
         )
@@ -409,7 +506,10 @@ class TransHead(nn.Module):
         denom = mask_f.sum(1).clamp(min=1.0)
         token_summary = (token_feats * mask_f).sum(1) / denom
         spatial_summary = cond.get("spatial_summary", cond["c_global"])
-        return torch.cat([cond["c_global"], token_summary, spatial_summary], dim=-1)
+        trans_anchor = cond.get("trans_anchor")
+        if trans_anchor is None:
+            trans_anchor = cond["c_global"].new_zeros(cond["c_global"].shape[0], TRANS_DIM)
+        return torch.cat([cond["c_global"], token_summary, spatial_summary, trans_anchor], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -444,9 +544,9 @@ class PoseDecoderModel(nn.Module):
     Pose decoder aligned with simplified (hand_part, slot) tokens.
 
     Key updates:
-      - remove contact_type and slot_geo_feat dependency
-      - use point-wise slot_labels in spatial conditioning
-      - make trans / shape heads use richer contact-conditioned summaries
+      - 128 SA2 points stay as geometry conditioning
+      - dense slot labels are summarized into slot tokens from the original object points
+      - slot labels no longer need point-wise alignment with SA2 samples
     """
 
     def __init__(
@@ -509,6 +609,7 @@ class PoseDecoderModel(nn.Module):
             obj_point_xyz=obj_point_xyz,
             slot_labels=slot_labels,
             slot_geo_feat=slot_geo_feat,
+            obj_pc=obj_pc,
         )
         if obj_pc is not None:
             cond["obj_pc"] = obj_pc
@@ -521,7 +622,15 @@ class PoseDecoderModel(nn.Module):
 
     def predict_trans(self, cond: dict) -> torch.Tensor:
         x = self.trans_head.build_input(cond)
-        return self.trans_head(x)
+        delta = self.trans_head(x)
+        anchor = cond.get("trans_anchor")
+        if anchor is None:
+            anchor = delta.new_zeros(delta.shape)
+        pred_trans_norm = anchor + delta
+        obj_scale = cond.get("obj_scale")
+        if obj_scale is None:
+            return pred_trans_norm
+        return pred_trans_norm * obj_scale
 
     def predict_shape(self, cond: dict) -> torch.Tensor:
         x = self.shape_head.build_input(cond)
@@ -547,7 +656,7 @@ class PoseDecoderModel(nn.Module):
             pred_pose_aa.view(-1, NUM_JOINTS, 3),
             gt_pose_aa.view(-1, NUM_JOINTS, 3),
         )
-        loss_trans = F.l1_loss(pred_trans, gt_trans)
+        loss_trans = torch.sqrt(((pred_trans - gt_trans) ** 2).mean().clamp_min(1e-12))
 
         return loss_rot, loss_trans, {
             "loss_rot": loss_rot.item(),
@@ -566,7 +675,7 @@ class PoseDecoderModel(nn.Module):
             pred_pose_aa.view(-1, NUM_JOINTS, 3),
             gt_pose_aa.view(-1, NUM_JOINTS, 3),
         )
-        loss_trans = F.l1_loss(pred_trans, gt_trans)
+        loss_trans = torch.sqrt(((pred_trans - gt_trans) ** 2).mean().clamp_min(1e-12))
         loss_shape = F.mse_loss(pred_shape, gt_shape)
 
         return PoseDecoderTrainOutput(
@@ -589,7 +698,8 @@ class PoseDecoderModel(nn.Module):
                 obj_point_feat: torch.Tensor | None = None,
                 obj_point_xyz: torch.Tensor | None = None,
                 slot_labels: torch.Tensor | None = None,
-                slot_geo_feat: torch.Tensor | None = None):
+                slot_geo_feat: torch.Tensor | None = None,
+                obj_pc: torch.Tensor | None = None):
         cond = self.encode_condition(
             tokens,
             mask,
@@ -598,6 +708,7 @@ class PoseDecoderModel(nn.Module):
             obj_point_xyz=obj_point_xyz,
             slot_labels=slot_labels,
             slot_geo_feat=slot_geo_feat,
+            obj_pc=obj_pc,
         )
         return self.sample(cond)
 

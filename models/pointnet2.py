@@ -156,14 +156,16 @@ class PointNetSetAbstraction(nn.Module):
             last_channel = out_channel
         self.group_all = group_all
 
-    def forward(self, xyz, points):
+    def forward(self, xyz, points, returnfps: bool = False):
         """
         Input:
             xyz: input points position data, [B, C, N]
             points: input points data, [B, D, N]
+            returnfps: whether to return FPS indices for this SA layer
         Return:
             new_xyz: sampled points position data, [B, C, S]
             new_points_concat: sample points feature data, [B, D', S]
+            fps_idx: sampled point indices, [B, S] when returnfps=True and not group_all
         """
         xyz = xyz.permute(0, 2, 1)
         if points is not None:
@@ -171,8 +173,17 @@ class PointNetSetAbstraction(nn.Module):
 
         if self.group_all:
             new_xyz, new_points = sample_and_group_all(xyz, points)
+            fps_idx = None
         else:
-            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+            if returnfps:
+                new_xyz, new_points, _, fps_idx = sample_and_group(
+                    self.npoint, self.radius, self.nsample, xyz, points, returnfps=True
+                )
+            else:
+                new_xyz, new_points = sample_and_group(
+                    self.npoint, self.radius, self.nsample, xyz, points
+                )
+                fps_idx = None
         # new_xyz: sampled points position data, [B, npoint, C]
         # new_points: sampled points data, [B, npoint, nsample, C+D]
         new_points = new_points.permute(0, 3, 2, 1)  # [B, C+D, nsample,npoint]
@@ -182,6 +193,8 @@ class PointNetSetAbstraction(nn.Module):
 
         new_points = torch.max(new_points, 2)[0]
         new_xyz = new_xyz.permute(0, 2, 1)
+        if returnfps:
+            return new_xyz, new_points, fps_idx
         return new_xyz, new_points
 
 

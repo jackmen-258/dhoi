@@ -1,13 +1,12 @@
 """
-train_decoder.py (v25 — Aligned with simplified token strategy)
-===================================================================
+train_decoder.py (v26 — geometry tokens + slot tokens)
+======================================================
 PoseDecoderModel 训练脚本 (简化版 token 策略)
 
-v24 → v25 改动:
-  - 适配新版 pose_decoder: 移除 contact_type, slot_geo_feat, 改用 slot_labels
-  - vocab_size: 112 → 26 (6 hand_parts × 4 slots + 2 special tokens)
-  - NUM_SLOTS: 6 → 4
-  - 数据加载: 使用 obj_slot_labels 替代 contact_type_matrix
+v26 改动:
+  - 128 个 SA2 点继续作为几何条件
+  - 原始 2048 点的 obj_slot_labels 被汇总为 slot tokens
+  - 不再要求 slot_labels 与 SA2 点逐点对齐
 
 用法:
   python train_decoder.py --epochs 100 --batch_size 128 --lambda_trans 0.01 --lambda_vert 0.02
@@ -31,6 +30,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from data.token_encoder import TokenEncoder
+from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.pose_decoder import build_pose_model, ROT6D_POSE_DIM, TRANS_DIM
 from utils.pose_utils import aa_to_rot6d
@@ -124,7 +124,7 @@ class TrainConfig:
 
     # ---- loss weights ----
     # Recalibrated under mm-scale objectives (see _train_step):
-    # loss_trans_mm = L1(trans) * 1000, loss_vert_mm = L1(verts) * 1000
+    # loss_trans_mm = RMSE(trans) * 1000, loss_vert_mm = vertex-L2 * 1000
     lambda_rot:   float = 1.0
     lambda_trans: float = 0.01
     lambda_shape: float = 1.0
@@ -183,6 +183,7 @@ class DecoderDataset(Dataset):
         self.cache_dir = cache_dir
         self.encoder   = TokenEncoder(config_path)
         self.mapper    = self.encoder.mapper
+        self.n_pc_points = n_pc_points
 
         with open(os.path.join(cache_dir, "dataset_index.json")) as f:
             index = json.load(f)
@@ -206,15 +207,18 @@ class DecoderDataset(Dataset):
         if cache_file not in self._npz_cache:
             data = np.load(os.path.join(self.cache_dir, cache_file),
                            allow_pickle=True)
-            # [v25] 加载 obj_slot_labels 替代 contact_type_matrix
             slot_labels = data.get("obj_slot_labels", None)
             if slot_labels is None:
-                # 如果缓存中没有 slot_labels，用全 -1 填充（兼容旧缓存）
-                slot_labels = np.full(self.encoder.mapper.max_token_length, -1, dtype=np.int32)
-            
+                slot_labels = np.full(self.n_pc_points, -1, dtype=np.int32)
+            elif slot_labels.ndim != 1 or len(slot_labels) != self.n_pc_points:
+                raise ValueError(
+                    f"{cache_file}: obj_slot_labels shape mismatch, "
+                    f"expected ({self.n_pc_points},), got {slot_labels.shape}"
+                )
+
             self._npz_cache[cache_file] = {
                 "token_seq":      data["token_seq"].astype(np.int64),
-                "slot_labels":    slot_labels.astype(np.int32),     # [v25] (N,) int32
+                "slot_labels":    slot_labels.astype(np.int32),
             }
         return self._npz_cache[cache_file]
 
@@ -236,7 +240,7 @@ class DecoderDataset(Dataset):
         return {
             "token_seq":   torch.from_numpy(token_seq),
             "token_mask":  torch.from_numpy(token_mask),
-            "slot_labels": torch.from_numpy(tok["slot_labels"]),   # [v25] (N,)
+            "slot_labels": torch.from_numpy(tok["slot_labels"]),
             "obj_pc":      torch.from_numpy(oi["obj_verts"]),
             "obj_vn":      torch.from_numpy(oi["obj_vn"]),
             "hand_pose":   torch.from_numpy(oi["hand_pose"]),
@@ -247,7 +251,6 @@ class DecoderDataset(Dataset):
 
 
 def _collate(batch):
-    # [v25] 移除 contact_type_matrix，添加 slot_labels
     keys = ["token_seq", "token_mask", "slot_labels",
             "obj_pc", "obj_vn", "hand_pose", "hand_shape", "hand_tsl", "hand_verts"]
     return {k: torch.stack([b[k] for b in batch]) for k in keys}
@@ -378,7 +381,6 @@ class Trainer:
             obj_point_dim=cfg.obj_point_dim,
             obj_xyz_dim=cfg.obj_xyz_dim,
             n_betas=cfg.n_betas,
-            # [v25] 新版 pose_decoder 默认 num_slots=4，无需显式传递
         ).to(self.device)
 
     def _build_optimizer(self):
@@ -395,15 +397,25 @@ class Trainer:
         n_model = self.model.count_parameters()
         cfg = self.cfg
         self.logger.info("=" * 60)
-        self.logger.info("PoseDecoderModel v25 — Simplified Token Strategy")
+        self.logger.info("PoseDecoderModel v26 — geometry tokens + slot tokens")
         self.logger.info(f"  Model:       {n_model:,} params ({n_model/1e6:.2f}M)")
         self.logger.info(f"  Vocab size:  {cfg.vocab_size} (was 112)")
         self.logger.info(f"  Token drop:  p={cfg.token_drop_prob}")
         self.logger.info(f"  Loss λ:      rot={cfg.lambda_rot}  trans={cfg.lambda_trans}  "
                          f"shape={cfg.lambda_shape}  vert={cfg.lambda_vert}")
+        self.logger.info("  Best metric: composite = rot + λ_trans*trs_mm + λ_shape*shape + λ_vert*vert_mm")
         self.logger.info(f"  Train:       {len(self.train_ds)} samples, "
                          f"{len(self.train_dl)} steps/epoch")
         self.logger.info("=" * 60)
+
+    def _compute_val_score(self, val: Dict[str, float]) -> float:
+        cfg = self.cfg
+        return (
+            cfg.lambda_rot * val.get("val/geo_rad", 0.0)
+            + cfg.lambda_trans * val.get("val/trs_mm", 0.0)
+            + cfg.lambda_shape * val.get("val/shape", 0.0)
+            + cfg.lambda_vert * val.get("val/vert_mm", 0.0)
+        )
 
     # ================================================================
     # Encode
@@ -411,7 +423,8 @@ class Trainer:
 
     def _encode_obj(self, obj_pc, obj_vn):
         """PointNet2 encode."""
-        obj_input = torch.cat([obj_pc, obj_vn], dim=-1)
+        obj_pc_norm, _ = normalize_object_points(obj_pc)
+        obj_input = torch.cat([obj_pc_norm, obj_vn], dim=-1)
         global_feat, point_feat, point_xyz = self.obj_enc(obj_input)
         return global_feat, point_feat, point_xyz
 
@@ -426,7 +439,7 @@ class Trainer:
         obj_vn   = batch["obj_vn"].to(self.device)
         tokens   = batch["token_seq"].to(self.device)
         t_mask   = batch["token_mask"].to(self.device)
-        slot_labels = batch["slot_labels"].to(self.device)   # [v25] (B, N)
+        slot_labels = batch["slot_labels"].to(self.device)
         gt_pose  = batch["hand_pose"].to(self.device)
         gt_trans = batch["hand_tsl"].to(self.device)
         gt_shape = batch["hand_shape"].to(self.device)
@@ -443,22 +456,21 @@ class Trainer:
         # ---- Forward ----
         self.optimizer.zero_grad()
 
-        # [v25] 新接口：使用 slot_labels 替代 slot_geo_feat
         cond = self.model.encode_condition(
-            tokens, t_mask, obj_global_feat, 
-            obj_point_feat, obj_point_xyz, 
-            slot_labels=slot_labels,  # [v25] 新参数
-            obj_pc=obj_pc)
+            tokens, t_mask, obj_global_feat,
+            obj_point_feat, obj_point_xyz,
+            slot_labels=slot_labels,
+            obj_pc=obj_pc,
+        )
 
         train_out = self.model.forward_train_all(
             gt_pose, gt_trans, gt_shape, cond)
 
-        # 计算顶点损失（保留梯度）
+        # Training metrics align with validation: trans RMSE + vertex L2, both in mm.
         pred_verts, _ = self.mano(train_out.pred_pose, train_out.pred_trans, train_out.pred_shape)
         gt_verts, _   = self.mano(gt_pose, gt_trans, gt_shape)
-        # Use mm-scale losses to align with validation targets.
         loss_trans_mm = train_out.loss_trans * 1000.0
-        loss_vert_mm = F.l1_loss(pred_verts, gt_verts) * 1000.0
+        loss_vert_mm = vert_l2_mm(pred_verts, gt_verts)
 
         loss = (cfg.lambda_rot   * train_out.loss_rot
               + cfg.lambda_trans * loss_trans_mm
@@ -500,16 +512,17 @@ class Trainer:
             obj_global_feat, obj_point_feat, obj_point_xyz = self._encode_obj(obj_pc, obj_vn)
             tokens   = batch["token_seq"].to(self.device)
             t_mask   = batch["token_mask"].to(self.device)
-            slot_labels = batch["slot_labels"].to(self.device)  # [v25]
+            slot_labels = batch["slot_labels"].to(self.device)
             gt_pose  = batch["hand_pose"].to(self.device)
             gt_trans = batch["hand_tsl"].to(self.device)
             gt_shape = batch["hand_shape"].to(self.device)
 
-            # [v25] 新接口
             cond = self.model.encode_condition(
-                tokens, t_mask, obj_global_feat, 
+                tokens, t_mask, obj_global_feat,
                 obj_point_feat, obj_point_xyz,
-                slot_labels=slot_labels)
+                slot_labels=slot_labels,
+                obj_pc=obj_pc,
+            )
             out = self.model.sample(cond)
 
             B = gt_pose.shape[0]
@@ -544,12 +557,13 @@ class Trainer:
         path = os.path.join(self.cfg.save_dir, f"{tag}.pt")
         torch.save({
             "model":       self.model.state_dict(),
-            "obj_enc":    self.obj_enc.state_dict(),
+            "obj_enc":     self.obj_enc.state_dict(),
             "optimizer":   self.optimizer.state_dict(),
             "scheduler":   self.scheduler.state_dict(),
             "epoch":       self.epoch,
             "global_step": self.global_step,
             "best_val":    self.best_val,
+            "best_score":  self.best_val,
             "config":      self.cfg.__dict__,
         }, path)
         self.logger.info(f"  Saved: {path}")
@@ -563,7 +577,7 @@ class Trainer:
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.epoch       = ckpt.get("epoch", 0)
         self.global_step = ckpt.get("global_step", 0)
-        self.best_val    = ckpt.get("best_val", float("inf"))
+        self.best_val    = ckpt.get("best_score", ckpt.get("best_val", float("inf")))
         self.logger.info(f"  Resumed: epoch={self.epoch}, step={self.global_step}")
 
     def _cleanup_checkpoints(self):
@@ -618,23 +632,26 @@ class Trainer:
                         vg = val.get("val/geo_rad", float("inf"))
                         vt = val.get("val/trs_mm", 0)
                         vv = val.get("val/vert_mm", float("inf"))
+                        vs = self._compute_val_score(val)
 
                         self.logger.info(
                             f"  [VAL]    "
                             f"geo={vg:.3f}rad  "
                             f"trs={vt:.1f}mm  "
-                            f"vert={vv:.1f}mm")
+                            f"vert={vv:.1f}mm  "
+                            f"score={vs:.4f}")
 
                         if self.tb:
                             for k, v in val.items():
                                 self.tb.add_scalar(k, v, self.global_step)
+                            self.tb.add_scalar("val/score", vs, self.global_step)
 
-                        if vg < self.best_val:
-                            self.best_val = vg
+                        if vs < self.best_val:
+                            self.best_val = vs
                             self._save_checkpoint("best")
                             self.logger.info(
-                                f"  ★ New best: geo={vg:.3f}rad  "
-                                f"trs={vt:.1f}mm  vert={vv:.1f}mm")
+                                f"  ★ New best: score={vs:.4f}  "
+                                f"geo={vg:.3f}rad  trs={vt:.1f}mm  vert={vv:.1f}mm")
 
                 if self.global_step % cfg.save_every == 0:
                     self._save_checkpoint("latest")
@@ -656,7 +673,7 @@ class Trainer:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train PoseDecoderModel v25 (simplified token strategy)")
+        description="Train PoseDecoderModel v26 (geometry tokens + slot tokens)")
 
     p.add_argument("--cache_dir",     type=str, default="cache/contact_tokens/train")
     p.add_argument("--val_cache_dir", type=str, default="cache/contact_tokens/val")

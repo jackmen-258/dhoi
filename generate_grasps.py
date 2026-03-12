@@ -4,9 +4,9 @@ generate_grasps.py (v14 — Point Encoder Inference)
 从物体点云生成抓握姿态
 
 架构:
-  单一 PointNet2Encoder (与 train_diffusion.py / train_decoder.py 对齐)
-  Stage 1: Point features → token denoiser → contact tokens
-  Stage 2: Point features → pose decoder → pose + trans + shape
+  双 PointNet2Encoder
+  Stage 1: diffusion_obj_enc + token denoiser → contact tokens
+  Stage 2: decoder_obj_enc + pose decoder → pose + trans + shape
 """
 
 import os
@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.token_denoiser import build_denoiser
 from models.pose_decoder import build_pose_model
@@ -71,16 +72,15 @@ def load_models(args, device):
     text_feat_dim = diff_cfg.get("text_feat_dim", args.text_feat_dim)
     use_text = diff_cfg.get("use_text", args.use_text)
 
-    obj_enc = PointNet2Encoder(
+    diffusion_obj_enc = PointNet2Encoder(
         in_dim=6,
         global_dim=obj_global_dim,
         point_dim=obj_point_dim,
     ).to(device)
 
-    # 优先使用 diffusion checkpoint 的 obj_enc（与训练一致）
     if "obj_enc" in diff_state:
-        obj_enc.load_state_dict(diff_state["obj_enc"])
-        logger.info("  Obj encoder loaded from diffusion checkpoint ✓")
+        diffusion_obj_enc.load_state_dict(diff_state["obj_enc"])
+        logger.info("  Diffusion obj encoder loaded from diffusion checkpoint ✓")
     else:
         logger.warning("  obj_enc not found in diffusion checkpoint, using initialized weights")
 
@@ -116,15 +116,23 @@ def load_models(args, device):
     ).to(device)
     decoder.load_state_dict(dec_state["model"])
 
-    # 如果 decoder checkpoint 里也有 obj_enc，则覆盖为 decoder 对应版本
-    if "obj_enc" in dec_state:
-        obj_enc.load_state_dict(dec_state["obj_enc"])
-        logger.info("  Obj encoder overridden from decoder checkpoint ✓")
+    decoder_obj_enc = PointNet2Encoder(
+        in_dim=6,
+        global_dim=dec_cfg.get("obj_global_dim", obj_global_dim),
+        point_dim=dec_cfg.get("obj_point_dim", obj_point_dim),
+    ).to(device)
 
-    obj_enc.eval()
+    if "obj_enc" in dec_state:
+        decoder_obj_enc.load_state_dict(dec_state["obj_enc"])
+        logger.info("  Decoder obj encoder loaded from decoder checkpoint ✓")
+    else:
+        logger.warning("  obj_enc not found in decoder checkpoint, using initialized weights")
+
+    diffusion_obj_enc.eval()
+    decoder_obj_enc.eval()
     denoiser.eval()
     decoder.eval()
-    for model in (obj_enc, denoiser, decoder):
+    for model in (diffusion_obj_enc, decoder_obj_enc, denoiser, decoder):
         for p in model.parameters():
             p.requires_grad = False
 
@@ -146,7 +154,8 @@ def load_models(args, device):
     mano.eval()
 
     return {
-        "obj_enc": obj_enc,
+        "diffusion_obj_enc": diffusion_obj_enc,
+        "decoder_obj_enc": decoder_obj_enc,
         "denoiser": denoiser,
         "diffusion": diffusion,
         "decoder": decoder,
@@ -158,18 +167,23 @@ def load_models(args, device):
 
 @torch.no_grad()
 def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
-    obj_enc = models["obj_enc"]
+    diffusion_obj_enc = models["diffusion_obj_enc"]
+    decoder_obj_enc = models["decoder_obj_enc"]
     denoiser = models["denoiser"]
     diffusion = models["diffusion"]
     decoder = models["decoder"]
     mano = models["mano"]
 
-    obj_input = torch.cat([obj_pc, obj_vn], dim=-1)
-    obj_global_feat, obj_point_feat, obj_point_xyz = obj_enc(obj_input)
+    diff_obj_input = torch.cat([obj_pc, obj_vn], dim=-1)
+    diff_obj_global_feat, diff_obj_point_feat, _ = diffusion_obj_enc(diff_obj_input)
+
+    obj_pc_norm, _ = normalize_object_points(obj_pc)
+    dec_obj_input = torch.cat([obj_pc_norm, obj_vn], dim=-1)
+    dec_obj_global_feat, dec_obj_point_feat, dec_obj_point_xyz = decoder_obj_enc(dec_obj_input)
 
     cond = {
-        "obj_feat": obj_global_feat,
-        "obj_point_feat": obj_point_feat,
+        "obj_feat": diff_obj_global_feat,
+        "obj_point_feat": diff_obj_point_feat,
     }
     if text_feat is not None:
         cond["text_feat"] = text_feat
@@ -185,7 +199,14 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
     tokens = result["samples"]
     inferred_mask = tokens != models["pad_token_id"]
 
-    pred = decoder(tokens, inferred_mask, obj_global_feat, obj_point_feat, obj_point_xyz)
+    pred = decoder(
+        tokens,
+        inferred_mask,
+        dec_obj_global_feat,
+        dec_obj_point_feat,
+        dec_obj_point_xyz,
+        obj_pc=obj_pc,
+    )
     verts, joints = mano(pred.pose, pred.trans, pred.shape)
 
     return (

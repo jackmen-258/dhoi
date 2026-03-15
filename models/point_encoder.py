@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Dict, Tuple
 
 from models.object_normalization import compute_object_scale, normalize_object_points
 from models.pointnet2 import PointNetSetAbstraction
@@ -73,8 +73,10 @@ class PointNet2Encoder(nn.Module):
         )
 
     def forward(
-        self, point_cloud: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, point_cloud: torch.Tensor, return_fps_indices: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]
+    ]:
         """
         Args:
             point_cloud: (B, N, in_dim)
@@ -89,8 +91,12 @@ class PointNet2Encoder(nn.Module):
         l0_xyz = x[:, :3, :]                    # (B, 3, N)
         l0_points = x[:, 3:, :] if x.shape[1] > 3 else None
 
-        l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
+        if return_fps_indices:
+            l1_xyz, l1_points, fps1_idx = self.sa1(l0_xyz, l0_points, returnfps=True)
+            l2_xyz, l2_points, fps2_local_idx = self.sa2(l1_xyz, l1_points, returnfps=True)
+        else:
+            l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
+            l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
         l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
 
         # global: (B, h*8, 1) → (B, h*8) → (B, global_dim)
@@ -102,6 +108,14 @@ class PointNet2Encoder(nn.Module):
         # point_xyz: (B, 3, 128) → (B, 128, 3)
         point_xyz = l2_xyz.permute(0, 2, 1).contiguous() 
 
+        if return_fps_indices:
+            fps2_idx = torch.gather(fps1_idx, 1, fps2_local_idx)
+            fps_indices = {
+                "fps1": fps1_idx,
+                "fps2_local": fps2_local_idx,
+                "fps2": fps2_idx,
+            }
+            return global_feat, point_feat, point_xyz, fps_indices
         return global_feat, point_feat, point_xyz
 
     def count_parameters(self) -> int:

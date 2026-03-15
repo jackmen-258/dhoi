@@ -1,15 +1,15 @@
 """
-train_decoder.py (v26 — geometry tokens + slot tokens)
-======================================================
-PoseDecoderModel 训练脚本 (简化版 token 策略)
+train_decoder.py (Flow Matching — OT-CFM)
+==========================================
+PoseFlowModel training script.
 
-v26 改动:
-  - 128 个 SA2 点继续作为几何条件
-  - 原始 2048 点的 obj_slot_labels 被汇总为 slot tokens
-  - 不再要求 slot_labels 与 SA2 点逐点对齐
+Changes from regression version:
+  - Training loss: OT-CFM velocity matching (single MSE, no lambda weighting)
+  - Validation: Euler ODE sampling → geo/trs/vert metrics
+  - lambda_rot/trans/shape/vert retained ONLY for val-score checkpoint selection
 
-用法:
-  python train_decoder.py --epochs 100 --batch_size 128 --lambda_trans 0.01 --lambda_vert 0.02
+Usage:
+  python train_decoder.py --epochs 200 --batch_size 64
 """
 
 import os
@@ -32,7 +32,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from data.token_encoder import TokenEncoder
 from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
-from models.pose_decoder import build_pose_model, ROT6D_POSE_DIM, TRANS_DIM
+from models.pose_decoder import build_flow_model, ROT6D_POSE_DIM, TRANS_DIM
 from utils.pose_utils import aa_to_rot6d
 from utils.pose_utils import _aa_to_rotmat_stable as _aa_to_rotmat
 from utils.pose_utils import _rotmat_to_aa_stable as _rotmat_to_aa
@@ -108,10 +108,10 @@ class TrainConfig:
     obj_global_dim: int = 256
     obj_point_dim:  int = 256
     obj_xyz_dim:    int = 3
-    vocab_size:   int = 26          # [v25] 6×4 + 2 = 26 (was 112)
+    vocab_size:   int = 26
 
     # ---- training ----
-    epochs:            int   = 100
+    epochs:            int   = 200
     batch_size:        int   = 64
     lr:                float = 1e-4
     weight_decay:      float = 0.01
@@ -120,11 +120,12 @@ class TrainConfig:
     balanced_sampling: bool  = False
 
     # ---- augmentation ----
-    token_drop_prob: float = 0.0        # contact token dropout 概率
+    token_drop_prob: float = 0.2
 
-    # ---- loss weights ----
-    # Recalibrated under mm-scale objectives (see _train_step):
-    # loss_trans_mm = RMSE(trans) * 1000, loss_vert_mm = vertex-L2 * 1000
+    # ---- flow matching ----
+    n_sample_steps: int = 20     # Euler ODE steps for validation sampling
+
+    # ---- val-score weights (NOT used for training loss) ----
     lambda_rot:   float = 1.0
     lambda_trans: float = 0.01
     lambda_shape: float = 1.0
@@ -373,8 +374,7 @@ class Trainer:
             point_dim=cfg.obj_point_dim,
         ).to(self.device)
 
-        # [v25] 使用新的接口：移除 num_contact_types，使用简化版配置
-        self.model = build_pose_model(
+        self.model = build_flow_model(
             cfg.model_config,
             vocab_size=cfg.vocab_size,
             obj_global_dim=cfg.obj_global_dim,
@@ -397,14 +397,16 @@ class Trainer:
         n_model = self.model.count_parameters()
         cfg = self.cfg
         self.logger.info("=" * 60)
-        self.logger.info("PoseDecoderModel v26 — geometry tokens + slot tokens")
-        self.logger.info(f"  Model:       {n_model:,} params ({n_model/1e6:.2f}M)")
-        self.logger.info(f"  Vocab size:  {cfg.vocab_size} (was 112)")
-        self.logger.info(f"  Token drop:  p={cfg.token_drop_prob}")
-        self.logger.info(f"  Loss λ:      rot={cfg.lambda_rot}  trans={cfg.lambda_trans}  "
+        self.logger.info("PoseFlowModel — OT Conditional Flow Matching")
+        self.logger.info(f"  Model:         {n_model:,} params ({n_model/1e6:.2f}M)")
+        self.logger.info(f"  State dim:     {self.model.x_dim} "
+                         f"(rot6d={ROT6D_POSE_DIM} + trans={TRANS_DIM} + shape={cfg.n_betas})")
+        self.logger.info(f"  Vocab size:    {cfg.vocab_size}")
+        self.logger.info(f"  Token drop:    p={cfg.token_drop_prob}")
+        self.logger.info(f"  ODE steps:     {cfg.n_sample_steps} (val sampling)")
+        self.logger.info(f"  Val-score λ:   rot={cfg.lambda_rot}  trans={cfg.lambda_trans}  "
                          f"shape={cfg.lambda_shape}  vert={cfg.lambda_vert}")
-        self.logger.info("  Best metric: composite = rot + λ_trans*trs_mm + λ_shape*shape + λ_vert*vert_mm")
-        self.logger.info(f"  Train:       {len(self.train_ds)} samples, "
+        self.logger.info(f"  Train:         {len(self.train_ds)} samples, "
                          f"{len(self.train_dl)} steps/epoch")
         self.logger.info("=" * 60)
 
@@ -421,15 +423,27 @@ class Trainer:
     # Encode
     # ================================================================
 
-    def _encode_obj(self, obj_pc, obj_vn):
+    def _encode_obj(self, obj_pc, obj_vn, return_fps_indices: bool = False):
         """PointNet2 encode."""
         obj_pc_norm, _ = normalize_object_points(obj_pc)
         obj_input = torch.cat([obj_pc_norm, obj_vn], dim=-1)
-        global_feat, point_feat, point_xyz = self.obj_enc(obj_input)
+        result = self.obj_enc(obj_input, return_fps_indices=return_fps_indices)
+        if return_fps_indices:
+            global_feat, point_feat, point_xyz, fps_indices = result
+            return global_feat, point_feat, point_xyz, fps_indices
+        global_feat, point_feat, point_xyz = result
         return global_feat, point_feat, point_xyz
 
+    def _downsample_slot_labels(self, slot_labels: torch.Tensor, fps_indices: Dict[str, torch.Tensor]) -> torch.Tensor:
+        fps2_idx = fps_indices["fps2"].to(device=slot_labels.device, dtype=torch.long)
+        if slot_labels.dim() != 2:
+            raise ValueError(f"slot_labels must be (B, N), got {slot_labels.shape}")
+        if fps2_idx.dim() != 2:
+            raise ValueError(f"fps2 must be (B, 128), got {fps2_idx.shape}")
+        return torch.gather(slot_labels, 1, fps2_idx)
+
     # ================================================================
-    # Train step
+    # Train step — Flow Matching
     # ================================================================
 
     def _train_step(self, batch) -> Dict[str, float]:
@@ -444,38 +458,28 @@ class Trainer:
         gt_trans = batch["hand_tsl"].to(self.device)
         gt_shape = batch["hand_shape"].to(self.device)
 
-        # ---- Augmentation (training only) ----
-
-        # Contact token dropout
+        # ---- Augmentation ----
         if cfg.token_drop_prob > 0:
             t_mask = apply_token_dropout(t_mask, cfg.token_drop_prob)
 
         # ---- Object point encode ----
-        obj_global_feat, obj_point_feat, obj_point_xyz = self._encode_obj(obj_pc, obj_vn)
+        obj_global_feat, obj_point_feat, obj_point_xyz, fps_indices = self._encode_obj(
+            obj_pc, obj_vn, return_fps_indices=True
+        )
+        slot_labels_128 = self._downsample_slot_labels(slot_labels, fps_indices)
 
-        # ---- Forward ----
+        # ---- Forward: flow matching ----
         self.optimizer.zero_grad()
 
         cond = self.model.encode_condition(
             tokens, t_mask, obj_global_feat,
             obj_point_feat, obj_point_xyz,
-            slot_labels=slot_labels,
+            slot_labels=slot_labels_128,
             obj_pc=obj_pc,
         )
 
-        train_out = self.model.forward_train_all(
-            gt_pose, gt_trans, gt_shape, cond)
-
-        # Training metrics align with validation: trans RMSE + vertex L2, both in mm.
-        pred_verts, _ = self.mano(train_out.pred_pose, train_out.pred_trans, train_out.pred_shape)
-        gt_verts, _   = self.mano(gt_pose, gt_trans, gt_shape)
-        loss_trans_mm = train_out.loss_trans * 1000.0
-        loss_vert_mm = vert_l2_mm(pred_verts, gt_verts)
-
-        loss = (cfg.lambda_rot   * train_out.loss_rot
-              + cfg.lambda_trans * loss_trans_mm
-              + cfg.lambda_shape * train_out.loss_shape
-              + cfg.lambda_vert  * loss_vert_mm)
+        x_data = self.model.pack_data(gt_pose, gt_trans, gt_shape, cond)
+        loss, metrics = self.model.compute_loss(x_data, cond)
 
         loss.backward()
         if cfg.max_grad_norm > 0:
@@ -485,16 +489,10 @@ class Trainer:
         self.optimizer.step()
         self.scheduler.step()
 
-        return {
-            "total":      loss.item(),
-            "rot":        train_out.loss_rot.item(),
-            "trans":      loss_trans_mm.item(),
-            "shape":      train_out.loss_shape.item(),
-            "vert":       loss_vert_mm.item(),
-        }
+        return metrics
 
     # ================================================================
-    # Validation — 无增强, 指标与训练监控相同
+    # Validation — ODE sampling + full metric computation
     # ================================================================
 
     @torch.no_grad()
@@ -509,21 +507,24 @@ class Trainer:
         for i, batch in enumerate(self.val_dl):
             obj_pc = batch["obj_pc"].to(self.device)
             obj_vn = batch["obj_vn"].to(self.device)
-            obj_global_feat, obj_point_feat, obj_point_xyz = self._encode_obj(obj_pc, obj_vn)
+            obj_global_feat, obj_point_feat, obj_point_xyz, fps_indices = self._encode_obj(
+                obj_pc, obj_vn, return_fps_indices=True
+            )
             tokens   = batch["token_seq"].to(self.device)
             t_mask   = batch["token_mask"].to(self.device)
             slot_labels = batch["slot_labels"].to(self.device)
             gt_pose  = batch["hand_pose"].to(self.device)
             gt_trans = batch["hand_tsl"].to(self.device)
             gt_shape = batch["hand_shape"].to(self.device)
+            slot_labels_128 = self._downsample_slot_labels(slot_labels, fps_indices)
 
             cond = self.model.encode_condition(
                 tokens, t_mask, obj_global_feat,
                 obj_point_feat, obj_point_xyz,
-                slot_labels=slot_labels,
+                slot_labels=slot_labels_128,
                 obj_pc=obj_pc,
             )
-            out = self.model.sample(cond)
+            out = self.model.sample(cond, n_steps=self.cfg.n_sample_steps)
 
             B = gt_pose.shape[0]
 
@@ -610,16 +611,15 @@ class Trainer:
                 log = self._train_step(batch)
                 self.global_step += 1
                 n_steps += 1
-                epoch_loss += log["total"]
+                epoch_loss += log["flow_loss"]
 
                 if self.global_step % cfg.log_every == 0:
                     self.logger.info(
                         f"  S{self.global_step:06d}  "
-                        f"loss={log['total']:.4f}  "
-                        f"rot={log['rot']:.4f}  "
-                        f"trans={log['trans']:.4f}  "
-                        f"shape={log['shape']:.4f}  "
-                        f"vert={log['vert']:.4f}")
+                        f"flow={log['flow_loss']:.4f}  "
+                        f"v_rot={log['v_rot']:.4f}  "
+                        f"v_trans={log['v_trans']:.4f}  "
+                        f"v_shape={log['v_shape']:.4f}")
 
                     if self.tb:
                         for k, v in log.items():
@@ -650,7 +650,7 @@ class Trainer:
                             self.best_val = vs
                             self._save_checkpoint("best")
                             self.logger.info(
-                                f"  ★ New best: score={vs:.4f}  "
+                                f"  * New best: score={vs:.4f}  "
                                 f"geo={vg:.3f}rad  trs={vt:.1f}mm  vert={vv:.1f}mm")
 
                 if self.global_step % cfg.save_every == 0:
@@ -661,7 +661,7 @@ class Trainer:
             dt = time.time() - t0
             self.logger.info(
                 f"  Epoch {ep} done  {dt:.0f}s  "
-                f"avg_loss={epoch_loss / max(n_steps, 1):.4f}")
+                f"avg_flow_loss={epoch_loss / max(n_steps, 1):.4f}")
 
         self._save_checkpoint("final")
         self.logger.info("Training complete.")
@@ -673,7 +673,7 @@ class Trainer:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train PoseDecoderModel v26 (geometry tokens + slot tokens)")
+        description="Train PoseFlowModel (OT-CFM)")
 
     p.add_argument("--cache_dir",     type=str, default="cache/contact_tokens/train")
     p.add_argument("--val_cache_dir", type=str, default="cache/contact_tokens/val")
@@ -684,9 +684,12 @@ def parse_args():
     p.add_argument("--obj_point_dim",  type=int, default=256)
     p.add_argument("--obj_xyz_dim",    type=int, default=3)
 
-    p.add_argument("--epochs",       type=int,   default=100)
+    p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=64)
-    p.add_argument("--lr",           type=float, default=3e-5)
+    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--n_sample_steps", type=int, default=20)
+
+    # Val-score weights (not used for training loss)
     p.add_argument("--lambda_rot",   type=float, default=1.0)
     p.add_argument("--lambda_trans", type=float, default=0.01)
     p.add_argument("--lambda_shape", type=float, default=1.0)
@@ -695,7 +698,7 @@ def parse_args():
     p.add_argument("--resume",       type=str, default="")
     p.add_argument("--save_dir",     type=str, default="checkpoints/decoder")
     p.add_argument("--log_dir",      type=str, default="logs/decoder")
-    p.add_argument("--seed",         type=int, default=904)
+    p.add_argument("--seed",         type=int, default=7725)
     p.add_argument(
         "--balanced_sampling",
         action="store_true",
@@ -718,6 +721,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        n_sample_steps=args.n_sample_steps,
         lambda_rot=args.lambda_rot,
         lambda_trans=args.lambda_trans,
         lambda_shape=args.lambda_shape,

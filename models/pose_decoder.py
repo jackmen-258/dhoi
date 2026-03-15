@@ -1,9 +1,24 @@
+"""
+pose_decoder.py — Flow Matching Pose Decoder
+=============================================
+Conditional Flow Matching (OT-CFM) model for generating hand pose (rot6d),
+translation, and shape parameters from contact tokens + object geometry.
+
+State vector x ∈ R^{X_DIM}:
+    x = [rot6d (96), trans_norm (3), shape (10)]
+    where trans_norm = (trans - trans_anchor) / obj_scale
+
+Training:  Learn velocity field v_θ(x_t, t, cond) via OT-CFM loss.
+Sampling:  Euler ODE integration from t=0 (noise) to t=1 (data).
+"""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from models.object_normalization import normalize_object_points
-from utils.pose_utils import rot6d_to_aa
+from models.object_normalization import compute_object_scale
+from utils.pose_utils import rot6d_to_aa, aa_to_rot6d
 
 
 NUM_HAND_PARTS = 6
@@ -12,6 +27,7 @@ AA_POSE_DIM = 48
 ROT6D_POSE_DIM = 96
 TRANS_DIM = 3
 NUM_SLOTS = 4
+DEFAULT_N_BETAS = 10
 
 # Token hand-part ids are assumed to follow:
 #   0=THUMB, 1=INDEX, 2=MIDDLE, 3=RING, 4=LITTLE, 5=PALM
@@ -39,20 +55,14 @@ def ensure_nonempty_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class PoseDecoderOutput:
-    pose: torch.Tensor
-    trans: torch.Tensor
-    shape: torch.Tensor
+    pose: torch.Tensor    # (B, 48) axis-angle
+    trans: torch.Tensor   # (B, 3) metric space
+    shape: torch.Tensor   # (B, 10) betas
 
 
-@dataclass
-class PoseDecoderTrainOutput:
-    pred_pose: torch.Tensor
-    pred_trans: torch.Tensor
-    pred_shape: torch.Tensor
-    loss_rot: torch.Tensor
-    loss_trans: torch.Tensor
-    loss_shape: torch.Tensor
-
+# ==============================================================================
+# Conditioning (unchanged from regression version)
+# ==============================================================================
 
 class ConditionBlock(nn.Module):
     """Transformer block with optional spatial cross-attention."""
@@ -106,8 +116,7 @@ class ConditionEncoder(nn.Module):
 
     Conditioning layout:
       - 128 SA2 points provide geometry tokens
-      - original dense slot labels provide 4 slot summary tokens
-      - slot labels are no longer forced to align with SA2 points one-by-one
+      - slot_labels are aligned to the same 128 SA2 points
     """
 
     def __init__(
@@ -144,23 +153,15 @@ class ConditionEncoder(nn.Module):
         nn.init.zeros_(self.obj_to_scale_shift[-1].weight)
         nn.init.zeros_(self.obj_to_scale_shift[-1].bias)
 
-        # SA2 geometry tokens stay point-wise.
-        spatial_in_dim = obj_point_dim + obj_xyz_dim
+        self.slot_point_emb_dim = int(slot_point_emb_dim)
+        self.slot_point_emb = nn.Embedding(num_slots + 1, self.slot_point_emb_dim)
+
+        spatial_in_dim = obj_point_dim + obj_xyz_dim + self.slot_point_emb_dim
         self.use_spatial = spatial_in_dim > 0
         if self.use_spatial:
             self.spatial_proj = nn.Sequential(
                 nn.Linear(spatial_in_dim, D), nn.SiLU(), nn.Linear(D, D)
             )
-
-        # Dense slot labels are summarized into one token per slot.
-        self.slot_token_emb_dim = int(slot_point_emb_dim)
-        self.slot_token_emb = nn.Embedding(num_slots, D)
-        self.slot_stat_dim = obj_xyz_dim * 2 + 2  # centroid, spread, ratio, present
-        self.slot_stat_proj = nn.Sequential(
-            nn.Linear(self.slot_stat_dim, D),
-            nn.SiLU(),
-            nn.Linear(D, D),
-        )
 
         self.blocks = nn.ModuleList([
             ConditionBlock(D, num_heads, dropout=dropout, use_spatial=self.use_spatial)
@@ -172,8 +173,6 @@ class ConditionEncoder(nn.Module):
         self._init_weights()
 
     def _build_token_lookup(self, V: int, H: int, S: int):
-        # semantic tokens are assumed to be [0, H*S)
-        # special / invalid ids map to padding buckets
         hp = torch.full((V,), H, dtype=torch.long)
         sl = torch.full((V,), S, dtype=torch.long)
         n_semantic = min(V, H * S)
@@ -186,88 +185,65 @@ class ConditionEncoder(nn.Module):
     def _init_weights(self):
         nn.init.normal_(self.hand_part_emb.weight, std=0.02)
         nn.init.normal_(self.slot_emb.weight, std=0.02)
-        nn.init.normal_(self.slot_token_emb.weight, std=0.02)
+        nn.init.normal_(self.slot_point_emb.weight, std=0.02)
 
-    def _build_slot_tokens(
+    def _embed_slot_labels(
         self,
         slot_labels: torch.Tensor | None,
-        obj_pc: torch.Tensor | None,
+        batch_size: int,
+        num_points: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if obj_pc is None:
-            batch_size = slot_labels.shape[0] if slot_labels is not None else 1
-            xyz = torch.zeros(
-                batch_size, 1, 3, device=device, dtype=self.slot_token_emb.weight.dtype
+    ) -> torch.Tensor:
+        if slot_labels is None:
+            ids = torch.full(
+                (batch_size, num_points),
+                self.unknown_slot_id,
+                dtype=torch.long,
+                device=device,
             )
-            labels = None
-            obj_scale = torch.ones(batch_size, 1, device=device, dtype=xyz.dtype)
         else:
-            xyz = obj_pc.to(device=device, dtype=self.slot_token_emb.weight.dtype)
-            xyz, obj_scale = normalize_object_points(xyz)
-            batch_size = xyz.shape[0]
-            labels = slot_labels.to(device=device, dtype=torch.long) if slot_labels is not None else None
-
-        slot_ids = torch.arange(self.num_slots, device=device, dtype=torch.long)
-        slot_base = self.slot_token_emb(slot_ids).unsqueeze(0).expand(batch_size, -1, -1)
-
-        stats = torch.zeros(
-            batch_size, self.num_slots, self.slot_stat_dim,
-            device=device, dtype=slot_base.dtype,
-        )
-        slot_centroids = torch.zeros(
-            batch_size, self.num_slots, 3,
-            device=device, dtype=slot_base.dtype,
-        )
-        slot_present = torch.zeros(
-            batch_size, self.num_slots,
-            device=device, dtype=slot_base.dtype,
-        )
-        if labels is None or obj_pc is None:
-            return slot_base + self.slot_stat_proj(stats), slot_centroids, slot_present, obj_scale
-
-        valid = (labels >= 0) & (labels < self.num_slots)
-        slot_masks = torch.stack([(labels == s) & valid for s in range(self.num_slots)], dim=-1)
-        slot_masks = slot_masks.to(dtype=xyz.dtype)
-
-        counts = slot_masks.sum(dim=1)  # (B, S)
-        denom = counts.clamp(min=1.0).unsqueeze(-1)
-
-        centroid = torch.einsum("bns,bnd->bsd", slot_masks, xyz) / denom
-        diff = (xyz.unsqueeze(2) - centroid.unsqueeze(1)).abs()
-        spread = (diff * slot_masks.unsqueeze(-1)).sum(dim=1) / denom
-
-        num_points = max(xyz.shape[1], 1)
-        ratio = counts / float(num_points)
-        present = (counts > 0).to(dtype=xyz.dtype)
-        stats = torch.cat(
-            [centroid, spread, ratio.unsqueeze(-1), present.unsqueeze(-1)],
-            dim=-1,
-        )
-        return slot_base + self.slot_stat_proj(stats), centroid, present, obj_scale
+            ids = slot_labels.to(device=device, dtype=torch.long)
+            ids = torch.where(
+                (ids >= 0) & (ids < self.num_slots),
+                ids,
+                torch.full_like(ids, self.unknown_slot_id),
+            )
+        return self.slot_point_emb(ids)
 
     def _build_trans_anchor(
         self,
         token_slots: torch.Tensor,
         token_mask: torch.Tensor,
-        slot_centroids: torch.Tensor,
-        slot_present: torch.Tensor,
+        point_slot_labels: torch.Tensor | None,
+        obj_point_xyz: torch.Tensor | None,
     ) -> torch.Tensor:
-        valid_slots = (
-            token_mask
-            & (token_slots >= 0)
-            & (token_slots < self.num_slots)
-        )
-        slot_ids = token_slots.clamp(min=0, max=self.num_slots - 1)
-        slot_weights = F.one_hot(slot_ids, num_classes=self.num_slots).to(slot_centroids.dtype)
-        slot_weights = slot_weights * valid_slots.unsqueeze(-1)
-        slot_weights = slot_weights.sum(dim=1)
-        slot_weights = slot_weights * slot_present
+        batch_size = token_slots.shape[0]
+        device = token_slots.device
+        if point_slot_labels is None or obj_point_xyz is None:
+            return torch.zeros(batch_size, 3, device=device, dtype=obj_point_xyz.dtype if obj_point_xyz is not None else torch.float32)
 
+        slot_ids = token_slots.clamp(min=0, max=self.num_slots - 1)
+        valid_slots = token_mask & (token_slots >= 0) & (token_slots < self.num_slots)
+        slot_weights = F.one_hot(slot_ids, num_classes=self.num_slots).to(obj_point_xyz.dtype)
+        slot_weights = slot_weights * valid_slots.unsqueeze(-1)
+        slot_weights = slot_weights.sum(dim=1)  # (B, S)
+
+        point_slot_ids = point_slot_labels.to(device=device, dtype=torch.long)
+        point_valid = (point_slot_ids >= 0) & (point_slot_ids < self.num_slots)
+        point_slot_ids = point_slot_ids.clamp(min=0, max=self.num_slots - 1)
+        point_one_hot = F.one_hot(point_slot_ids, num_classes=self.num_slots).to(obj_point_xyz.dtype)
+        point_one_hot = point_one_hot * point_valid.unsqueeze(-1)
+        counts = point_one_hot.sum(dim=1)
+        denom = counts.clamp(min=1.0).unsqueeze(-1)
+        slot_centroids = torch.einsum("bns,bnd->bsd", point_one_hot, obj_point_xyz) / denom
+        slot_present = (counts > 0).to(obj_point_xyz.dtype)
+
+        slot_weights = slot_weights * slot_present
         fallback = slot_present
         has_weight = slot_weights.sum(dim=-1, keepdim=True) > 0
         slot_weights = torch.where(has_weight, slot_weights, fallback)
-        denom = slot_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        return torch.einsum("bs,bsd->bd", slot_weights, slot_centroids) / denom
+        slot_denom = slot_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        return torch.einsum("bs,bsd->bd", slot_weights, slot_centroids) / slot_denom
 
     def forward(self, contact_tokens: torch.Tensor, token_mask: torch.Tensor,
                 obj_global_feat: torch.Tensor,
@@ -290,7 +266,6 @@ class ConditionEncoder(nn.Module):
         scale, shift = self.obj_to_scale_shift(obj_global_feat).chunk(2, dim=-1)
         h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        geometry_tokens = None
         spatial_summary = c_global
         if self.use_spatial and (obj_point_feat is not None or obj_point_xyz is not None):
             if obj_point_feat is None:
@@ -300,25 +275,19 @@ class ConditionEncoder(nn.Module):
                     obj_point_feat.shape[0], obj_point_feat.shape[1], 3
                 )
 
-            spatial_in = torch.cat([obj_point_feat, obj_point_xyz], dim=-1)
-            geometry_tokens = self.spatial_proj(spatial_in)
+            num_points = obj_point_feat.shape[1]
+            slot_feat = self._embed_slot_labels(slot_labels, B, num_points, obj_point_feat.device)
+            spatial_in = torch.cat([obj_point_feat, obj_point_xyz, slot_feat], dim=-1)
+            spatial_kv = self.spatial_proj(spatial_in)
+            spatial_summary = spatial_kv.mean(dim=1)
+        else:
+            spatial_kv = None
 
-        slot_tokens, slot_centroids, slot_present, obj_scale = self._build_slot_tokens(
-            slot_labels, obj_pc, obj_global_feat.device
-        )
-        trans_anchor = self._build_trans_anchor(sl, token_mask, slot_centroids, slot_present)
-
-        cond_kv_parts = []
-        summary_parts = []
-        if geometry_tokens is not None:
-            cond_kv_parts.append(geometry_tokens)
-            summary_parts.append(geometry_tokens.mean(dim=1))
-        if slot_tokens is not None:
-            cond_kv_parts.append(slot_tokens)
-            summary_parts.append(slot_tokens.mean(dim=1))
-        spatial_kv = torch.cat(cond_kv_parts, dim=1) if cond_kv_parts else None
-        if summary_parts:
-            spatial_summary = torch.stack(summary_parts, dim=1).mean(dim=1)
+        trans_anchor = self._build_trans_anchor(sl, token_mask, slot_labels, obj_point_xyz)
+        if obj_pc is not None:
+            obj_scale = compute_object_scale(obj_pc.to(device=obj_global_feat.device, dtype=obj_global_feat.dtype))
+        else:
+            obj_scale = obj_global_feat.new_ones(B, 1)
 
         pad_mask = ~token_mask
         for blk in self.blocks:
@@ -332,14 +301,15 @@ class ConditionEncoder(nn.Module):
             "token_parts": hp,
             "token_slots": sl,
             "spatial_summary": spatial_summary,
-            "slot_tokens": slot_tokens,
-            "slot_centroids": slot_centroids,
-            "slot_present": slot_present,
             "trans_anchor": trans_anchor,
             "obj_scale": obj_scale,
             "obj_point_xyz": obj_point_xyz,
         }
 
+
+# ==============================================================================
+# Transformer blocks (reused from regression version)
+# ==============================================================================
 
 class PoseHeadBlock(nn.Module):
     """Pose head block with weak part / slot priors over token attention."""
@@ -419,134 +389,173 @@ class PoseHeadBlock(nn.Module):
         return h
 
 
-class PoseHead(nn.Module):
-    """Predict 6D rotation for 16 joints."""
+# ==============================================================================
+# Flow Matching components
+# ==============================================================================
+
+class TimestepEmbedding(nn.Module):
+    """Sinusoidal → MLP timestep embedding."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        assert dim % 2 == 0
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.SiLU(), nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) in [0, 1] → (B, dim)."""
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device, dtype=t.dtype) / half
+        )
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.mlp(emb)
+
+
+class FlowTrunk(nn.Module):
+    """
+    Velocity field network for flow matching.
+
+    Takes noisy state x_t, timestep t, and conditioning cond to predict velocity.
+    Architecture mirrors SharedTaskTrunk but injects x_t and t:
+      - Per-joint noisy rot6d → projected and added to joint queries
+      - Noisy trans_norm + shape → projected into cond_vec (FiLM)
+      - Timestep → sinusoidal embedding added to cond_vec
+    """
 
     def __init__(self, hidden_dim: int = 512, num_blocks: int = 8,
                  num_heads: int = 8, num_slots: int = NUM_SLOTS,
-                 dropout: float = 0.1):
+                 n_betas: int = DEFAULT_N_BETAS, dropout: float = 0.1):
         super().__init__()
         D = hidden_dim
+        self.n_betas = n_betas
+        self.x_dim = ROT6D_POSE_DIM + TRANS_DIM + n_betas
 
+        # Joint queries + positional embedding
         self.joint_queries = nn.Parameter(torch.randn(NUM_JOINTS, D) * 0.02)
         self.joint_pos_emb = nn.Embedding(NUM_JOINTS, D)
         nn.init.normal_(self.joint_pos_emb.weight, std=0.02)
-
         self.register_buffer("joint_parts", torch.tensor(JOINT_TO_PART, dtype=torch.long))
 
-        self.cond_proj = nn.Sequential(
-            nn.Linear(D, D), nn.SiLU(), nn.Linear(D, D)
+        # Timestep embedding
+        self.time_emb = TimestepEmbedding(D)
+
+        # Noisy state injection
+        self.x_rot_proj = nn.Sequential(
+            nn.Linear(6, D), nn.SiLU(), nn.Linear(D, D)
+        )
+        self.x_global_proj = nn.Sequential(
+            nn.Linear(TRANS_DIM + n_betas, D), nn.SiLU(), nn.Linear(D, D)
         )
 
+        # Condition projection
+        self.cond_proj = nn.Sequential(nn.Linear(D, D), nn.SiLU(), nn.Linear(D, D))
+
+        # Transformer blocks
         self.blocks = nn.ModuleList([
             PoseHeadBlock(D, D, num_heads=num_heads, num_slots=num_slots, dropout=dropout)
             for _ in range(num_blocks)
         ])
-        self.out_norm = nn.LayerNorm(D)
+        self.joint_norm = nn.LayerNorm(D)
 
-        self.wrist_head = nn.Linear(D, 6)
-        self.finger_head = nn.Linear(D, 6)
-        nn.init.normal_(self.wrist_head.weight, std=0.01)
-        nn.init.zeros_(self.wrist_head.bias)
-        nn.init.normal_(self.finger_head.weight, std=0.01)
-        nn.init.zeros_(self.finger_head.bias)
+        # Global latent
+        self.global_proj = nn.Sequential(
+            nn.Linear(D * 3, D), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(D, D),
+        )
 
-    def build_input(self, cond: dict) -> dict:
-        B = cond["c_global"].shape[0]
-        device = cond["c_global"].device
-        return {
-            "token_kv": cond["token_feats"],
-            "token_mask": cond["token_mask"],
-            "token_parts": cond["token_parts"],
-            "token_slots": cond["token_slots"],
-            "cond_vec": self.cond_proj(cond["c_global"]),
-            "device": device,
-            "B": B,
-        }
+        # Velocity output heads (zero-init for stable start)
+        self.vel_rot_head = nn.Linear(D, 6)
+        nn.init.zeros_(self.vel_rot_head.weight)
+        nn.init.zeros_(self.vel_rot_head.bias)
 
-    def forward(self, token_kv: torch.Tensor, token_mask: torch.Tensor,
-                token_parts: torch.Tensor, token_slots: torch.Tensor,
-                cond_vec: torch.Tensor, device: torch.device, B: int) -> torch.Tensor:
+        self.vel_global_head = nn.Sequential(
+            nn.Linear(D, D // 2), nn.SiLU(),
+            nn.Linear(D // 2, TRANS_DIM + n_betas),
+        )
+        nn.init.zeros_(self.vel_global_head[-1].weight)
+        nn.init.zeros_(self.vel_global_head[-1].bias)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: dict) -> torch.Tensor:
+        """
+        Predict velocity field v_θ(x_t, t, cond).
+
+        Args:
+            x_t: (B, X_DIM) noisy state [rot6d, trans_norm, shape]
+            t:   (B,) timestep in [0, 1]
+            cond: dict from ConditionEncoder
+
+        Returns:
+            v: (B, X_DIM) predicted velocity
+        """
+        B = x_t.shape[0]
+        device = x_t.device
+
+        # Decompose noisy state
+        rot6d_t = x_t[:, :ROT6D_POSE_DIM].reshape(B, NUM_JOINTS, 6)
+        global_t = x_t[:, ROT6D_POSE_DIM:]  # (B, TRANS_DIM + n_betas)
+
+        # Embeddings
+        t_emb = self.time_emb(t)                      # (B, D)
+        rot_emb = self.x_rot_proj(rot6d_t)            # (B, 16, D)
+        global_emb = self.x_global_proj(global_t)     # (B, D)
+
+        # Build joint queries with noisy rot6d injection
         h = self.joint_queries.unsqueeze(0).expand(B, -1, -1)
         h = h + self.joint_pos_emb(torch.arange(NUM_JOINTS, device=device)).unsqueeze(0)
+        h = h + rot_emb
+
+        # Conditioning from tokens + object
+        token_kv = cond["token_feats"]
+        token_mask = cond["token_mask"]
+        token_parts = cond["token_parts"]
+        token_slots = cond["token_slots"]
+        c_global = cond["c_global"]
 
         part_align_mask = (
             (self.joint_parts.view(1, NUM_JOINTS, 1) == token_parts.unsqueeze(1))
             & token_mask.unsqueeze(1)
         )
 
+        # cond_vec = object context + timestep + noisy global state
+        cond_vec = self.cond_proj(c_global) + t_emb + global_emb
+
+        # Transformer blocks
         for blk in self.blocks:
             h = blk(h, cond_vec, token_kv, token_mask, part_align_mask, token_slots)
-        h = self.out_norm(h)
+        joint_latent = self.joint_norm(h)
 
-        wrist_rot = self.wrist_head(h[:, 0:1, :])
-        finger_rot = self.finger_head(h[:, 1:, :])
-        rot_6d = torch.cat([wrist_rot, finger_rot], dim=1)
-        return rot_6d.reshape(B, ROT6D_POSE_DIM)
-
-
-class TransHead(nn.Module):
-    """Predict normalized residual translation on top of an object anchor."""
-
-    def __init__(self, hidden_dim: int = 512, dropout: float = 0.1):
-        super().__init__()
-        D = hidden_dim
-        self.net = nn.Sequential(
-            nn.Linear(D * 3 + TRANS_DIM, D), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(D, D // 2), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(D // 2, TRANS_DIM),
-        )
-        nn.init.normal_(self.net[-1].weight, std=0.01)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def build_input(self, cond: dict) -> torch.Tensor:
-        token_feats = cond["token_feats"]
-        token_mask = cond["token_mask"]
+        # Global latent
         mask_f = token_mask.float().unsqueeze(-1)
-        denom = mask_f.sum(1).clamp(min=1.0)
-        token_summary = (token_feats * mask_f).sum(1) / denom
-        spatial_summary = cond.get("spatial_summary", cond["c_global"])
-        trans_anchor = cond.get("trans_anchor")
-        if trans_anchor is None:
-            trans_anchor = cond["c_global"].new_zeros(cond["c_global"].shape[0], TRANS_DIM)
-        return torch.cat([cond["c_global"], token_summary, spatial_summary, trans_anchor], dim=-1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class ShapeHead(nn.Module):
-    """Predict MANO shape from global and contact-conditioned summaries."""
-
-    def __init__(self, hidden_dim: int = 512, n_betas: int = 10, dropout: float = 0.1):
-        super().__init__()
-        D = hidden_dim
-        self.net = nn.Sequential(
-            nn.Linear(D * 2, D), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(D, D // 2), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(D // 2, n_betas),
+        token_denom = mask_f.sum(1).clamp(min=1.0)
+        token_summary = (token_kv * mask_f).sum(1) / token_denom
+        joint_summary = joint_latent.mean(dim=1)
+        spatial_summary = cond.get("spatial_summary", c_global)
+        global_latent = self.global_proj(
+            torch.cat([joint_summary, token_summary, spatial_summary], dim=-1)
         )
 
-    def build_input(self, cond: dict) -> torch.Tensor:
-        token_feats = cond["token_feats"]
-        token_mask = cond["token_mask"]
-        mask_f = token_mask.float().unsqueeze(-1)
-        denom = mask_f.sum(1).clamp(min=1.0)
-        token_summary = (token_feats * mask_f).sum(1) / denom
-        return torch.cat([cond["c_global"], token_summary], dim=-1)
+        # Predict velocity
+        v_rot = self.vel_rot_head(joint_latent).reshape(B, ROT6D_POSE_DIM)
+        v_global = self.vel_global_head(global_latent + t_emb + global_emb)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return torch.cat([v_rot, v_global], dim=-1)
 
 
-class PoseDecoderModel(nn.Module):
+# ==============================================================================
+# Top-level Flow Matching Model
+# ==============================================================================
+
+class PoseFlowModel(nn.Module):
     """
-    Pose decoder aligned with simplified (hand_part, slot) tokens.
+    Flow Matching pose decoder.
 
-    Key updates:
-      - 128 SA2 points stay as geometry conditioning
-      - dense slot labels are summarized into slot tokens from the original object points
-      - slot labels no longer need point-wise alignment with SA2 samples
+    Learns a conditional velocity field to generate hand pose, translation,
+    and shape from contact tokens and object geometry.
     """
 
     def __init__(
@@ -560,15 +569,16 @@ class PoseDecoderModel(nn.Module):
         obj_xyz_dim: int = 3,
         num_hand_parts: int = NUM_HAND_PARTS,
         num_slots: int = NUM_SLOTS,
-        n_betas: int = 10,
+        n_betas: int = DEFAULT_N_BETAS,
         dropout: float = 0.1,
-        num_pose_blocks: int = 8,
+        num_flow_blocks: int = 8,
         slot_point_emb_dim: int = 64,
-        num_contact_types: int | None = None,
+        num_contact_types: int | None = None,   # backward compat, ignored
     ):
         super().__init__()
-        del num_contact_types  # backward compatibility only
-        self.num_slots = num_slots
+        del num_contact_types
+        self.n_betas = n_betas
+        self.x_dim = ROT6D_POSE_DIM + TRANS_DIM + n_betas
 
         self.cond_encoder = ConditionEncoder(
             vocab_size=vocab_size,
@@ -584,15 +594,18 @@ class PoseDecoderModel(nn.Module):
             dropout=dropout,
         )
 
-        self.pose_head = PoseHead(
+        self.flow_trunk = FlowTrunk(
             hidden_dim=hidden_dim,
-            num_blocks=num_pose_blocks,
+            num_blocks=num_flow_blocks,
             num_heads=num_heads,
             num_slots=num_slots,
+            n_betas=n_betas,
             dropout=dropout,
         )
-        self.trans_head = TransHead(hidden_dim=hidden_dim, dropout=dropout)
-        self.shape_head = ShapeHead(hidden_dim=hidden_dim, n_betas=n_betas, dropout=dropout)
+
+    # ----------------------------------------------------------------
+    # Condition encoding (same API as regression version)
+    # ----------------------------------------------------------------
 
     def encode_condition(self, tokens: torch.Tensor, mask: torch.Tensor,
                          obj_global_feat: torch.Tensor,
@@ -615,83 +628,117 @@ class PoseDecoderModel(nn.Module):
             cond["obj_pc"] = obj_pc
         return cond
 
-    def predict_pose(self, cond: dict) -> torch.Tensor:
-        inputs = self.pose_head.build_input(cond)
-        rot_6d = self.pose_head(**inputs)
-        return rot6d_to_aa(rot_6d)
+    # ----------------------------------------------------------------
+    # State packing / unpacking
+    # ----------------------------------------------------------------
 
-    def predict_trans(self, cond: dict) -> torch.Tensor:
-        x = self.trans_head.build_input(cond)
-        delta = self.trans_head(x)
-        anchor = cond.get("trans_anchor")
-        if anchor is None:
-            anchor = delta.new_zeros(delta.shape)
-        pred_trans_norm = anchor + delta
-        obj_scale = cond.get("obj_scale")
-        if obj_scale is None:
-            return pred_trans_norm
-        return pred_trans_norm * obj_scale
+    def pack_data(self, gt_pose_aa: torch.Tensor, gt_trans: torch.Tensor,
+                  gt_shape: torch.Tensor, cond: dict) -> torch.Tensor:
+        """Pack ground truth into normalized flow state vector."""
+        rot6d = aa_to_rot6d(gt_pose_aa)                 # (B, 96)
+        anchor = cond.get("trans_anchor",
+                          gt_trans.new_zeros(gt_trans.shape[0], TRANS_DIM))
+        scale = cond.get("obj_scale",
+                         gt_trans.new_ones(gt_trans.shape[0], 1))
+        trans_norm = (gt_trans - anchor) / scale         # (B, 3)
+        return torch.cat([rot6d, trans_norm, gt_shape], dim=-1)
 
-    def predict_shape(self, cond: dict) -> torch.Tensor:
-        x = self.shape_head.build_input(cond)
-        return self.shape_head(x)
+    def unpack_data(self, x: torch.Tensor, cond: dict) -> PoseDecoderOutput:
+        """Unpack flow state vector to pose (aa), trans (metric), shape."""
+        rot6d = x[:, :ROT6D_POSE_DIM]
+        trans_norm = x[:, ROT6D_POSE_DIM:ROT6D_POSE_DIM + TRANS_DIM]
+        shape = x[:, ROT6D_POSE_DIM + TRANS_DIM:]
 
-    def _predict_all(self, cond: dict):
-        pose_inputs = self.pose_head.build_input(cond)
-        rot_6d = self.pose_head(**pose_inputs)
+        pose_aa = rot6d_to_aa(rot6d)
+        anchor = cond.get("trans_anchor",
+                          trans_norm.new_zeros(trans_norm.shape[0], TRANS_DIM))
+        scale = cond.get("obj_scale",
+                         trans_norm.new_ones(trans_norm.shape[0], 1))
+        trans = trans_norm * scale + anchor
 
-        trans_x = self.trans_head.build_input(cond)
-        trans = self.trans_head(trans_x)
+        return PoseDecoderOutput(pose=pose_aa, trans=trans, shape=shape)
 
-        shape_x = self.shape_head.build_input(cond)
-        shape = self.shape_head(shape_x)
-        return rot_6d, trans, shape
+    # ----------------------------------------------------------------
+    # Velocity prediction
+    # ----------------------------------------------------------------
 
-    def forward_train(self, gt_pose_aa: torch.Tensor, gt_trans: torch.Tensor, cond: dict):
-        rot_6d, pred_trans, _ = self._predict_all(cond)
-        pred_pose_aa = rot6d_to_aa(rot_6d)
+    def forward_velocity(self, x_t: torch.Tensor, t: torch.Tensor,
+                         cond: dict) -> torch.Tensor:
+        """Predict velocity v_θ(x_t, t, cond)."""
+        return self.flow_trunk(x_t, t, cond)
 
-        from models.loss import geodesic_loss
-        loss_rot = geodesic_loss(
-            pred_pose_aa.view(-1, NUM_JOINTS, 3),
-            gt_pose_aa.view(-1, NUM_JOINTS, 3),
-        )
-        loss_trans = torch.sqrt(((pred_trans - gt_trans) ** 2).mean().clamp_min(1e-12))
+    # ----------------------------------------------------------------
+    # Training: OT-CFM loss
+    # ----------------------------------------------------------------
 
-        return loss_rot, loss_trans, {
-            "loss_rot": loss_rot.item(),
-            "loss_trans": loss_trans.item(),
-            "pred_pose": pred_pose_aa,
-            "pred_trans": pred_trans,
+    def compute_loss(self, x_data: torch.Tensor, cond: dict) -> tuple:
+        """
+        OT Conditional Flow Matching loss.
+
+        Path:  x_t = (1-t) * noise + t * x_data
+        Target velocity:  v = x_data - noise
+
+        Returns:
+            loss: scalar
+            metrics: dict with per-component MSE
+        """
+        B = x_data.shape[0]
+        device = x_data.device
+
+        t = torch.rand(B, device=device)
+        noise = torch.randn_like(x_data)
+
+        t_expand = t.unsqueeze(-1)
+        x_t = (1.0 - t_expand) * noise + t_expand * x_data
+        v_target = x_data - noise
+
+        v_pred = self.forward_velocity(x_t, t, cond)
+
+        # Total loss
+        loss = F.mse_loss(v_pred, v_target)
+
+        # Per-component MSE for monitoring
+        with torch.no_grad():
+            rot_end = ROT6D_POSE_DIM
+            trans_end = rot_end + TRANS_DIM
+            v_rot_mse = F.mse_loss(v_pred[:, :rot_end], v_target[:, :rot_end])
+            v_trans_mse = F.mse_loss(v_pred[:, rot_end:trans_end], v_target[:, rot_end:trans_end])
+            v_shape_mse = F.mse_loss(v_pred[:, trans_end:], v_target[:, trans_end:])
+
+        return loss, {
+            "flow_loss": loss.item(),
+            "v_rot": v_rot_mse.item(),
+            "v_trans": v_trans_mse.item(),
+            "v_shape": v_shape_mse.item(),
         }
 
-    def forward_train_all(self, gt_pose_aa: torch.Tensor, gt_trans: torch.Tensor,
-                          gt_shape: torch.Tensor, cond: dict) -> PoseDecoderTrainOutput:
-        rot_6d, pred_trans, pred_shape = self._predict_all(cond)
-        pred_pose_aa = rot6d_to_aa(rot_6d)
-
-        from models.loss import geodesic_loss
-        loss_rot = geodesic_loss(
-            pred_pose_aa.view(-1, NUM_JOINTS, 3),
-            gt_pose_aa.view(-1, NUM_JOINTS, 3),
-        )
-        loss_trans = torch.sqrt(((pred_trans - gt_trans) ** 2).mean().clamp_min(1e-12))
-        loss_shape = F.mse_loss(pred_shape, gt_shape)
-
-        return PoseDecoderTrainOutput(
-            pred_pose=pred_pose_aa,
-            pred_trans=pred_trans,
-            pred_shape=pred_shape,
-            loss_rot=loss_rot,
-            loss_trans=loss_trans,
-            loss_shape=loss_shape,
-        )
+    # ----------------------------------------------------------------
+    # Sampling: Euler ODE integration
+    # ----------------------------------------------------------------
 
     @torch.no_grad()
-    def sample(self, cond: dict) -> PoseDecoderOutput:
-        rot_6d, trans, shape = self._predict_all(cond)
-        pose_aa = rot6d_to_aa(rot_6d)
-        return PoseDecoderOutput(pose=pose_aa, trans=trans, shape=shape)
+    def sample(self, cond: dict, n_steps: int = 20) -> PoseDecoderOutput:
+        """
+        Generate samples via Euler ODE integration.
+
+        Integrates from t=0 (noise) to t=1 (data).
+        """
+        B = cond["c_global"].shape[0]
+        device = cond["c_global"].device
+
+        x = torch.randn(B, self.x_dim, device=device)
+        dt = 1.0 / n_steps
+
+        for i in range(n_steps):
+            t = torch.full((B,), i * dt, device=device)
+            v = self.forward_velocity(x, t, cond)
+            x = x + v * dt
+
+        return self.unpack_data(x, cond)
+
+    # ----------------------------------------------------------------
+    # Convenience forward (for inference / train_refine.py compat)
+    # ----------------------------------------------------------------
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor,
                 obj_global_feat: torch.Tensor,
@@ -699,31 +746,38 @@ class PoseDecoderModel(nn.Module):
                 obj_point_xyz: torch.Tensor | None = None,
                 slot_labels: torch.Tensor | None = None,
                 slot_geo_feat: torch.Tensor | None = None,
-                obj_pc: torch.Tensor | None = None):
+                obj_pc: torch.Tensor | None = None,
+                n_steps: int = 20):
         cond = self.encode_condition(
-            tokens,
-            mask,
-            obj_global_feat,
+            tokens, mask, obj_global_feat,
             obj_point_feat=obj_point_feat,
             obj_point_xyz=obj_point_xyz,
             slot_labels=slot_labels,
             slot_geo_feat=slot_geo_feat,
             obj_pc=obj_pc,
         )
-        return self.sample(cond)
+        return self.sample(cond, n_steps=n_steps)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+# ==============================================================================
+# Presets & builders
+# ==============================================================================
+
 _PRESETS = {
-    "small": dict(hidden_dim=256, num_layers=2, num_heads=8, num_pose_blocks=6),
-    "base": dict(hidden_dim=512, num_layers=3, num_heads=8, num_pose_blocks=8),
-    "large": dict(hidden_dim=768, num_layers=4, num_heads=12, num_pose_blocks=10),
+    "small": dict(hidden_dim=256, num_layers=2, num_heads=8, num_flow_blocks=6),
+    "base": dict(hidden_dim=512, num_layers=3, num_heads=8, num_flow_blocks=8),
+    "large": dict(hidden_dim=768, num_layers=4, num_heads=12, num_flow_blocks=10),
 }
 
 
-def build_pose_model(config: str = "base", **kw):
+def build_flow_model(config: str = "base", **kw):
     params = _PRESETS[config].copy()
     params.update(kw)
-    return PoseDecoderModel(**params)
+    return PoseFlowModel(**params)
+
+
+# Backward-compatible alias for train_refine.py
+build_pose_model = build_flow_model

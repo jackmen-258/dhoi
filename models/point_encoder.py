@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Tuple
-
-from models.object_normalization import compute_object_scale, normalize_object_points
 from models.pointnet2 import PointNetSetAbstraction
 
 class PointNet2Encoder(nn.Module):
@@ -40,13 +38,13 @@ class PointNet2Encoder(nn.Module):
         sa1_in = in_dim if in_dim > 3 else 3
 
         self.sa1 = PointNetSetAbstraction(
-            npoint=512, radius=0.1, nsample=32,
+            npoint=512, radius=0.2, nsample=32,
             in_channel=sa1_in,
             mlp=[hidden_dim, hidden_dim * 2],
             group_all=False,
         )
         self.sa2 = PointNetSetAbstraction(
-            npoint=128, radius=0.2, nsample=64,
+            npoint=128, radius=0.4, nsample=64,
             in_channel=hidden_dim * 2 + 3,
             mlp=[hidden_dim * 2, hidden_dim * 4],
             group_all=False,

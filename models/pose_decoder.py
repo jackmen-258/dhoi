@@ -6,7 +6,7 @@ translation, and shape parameters from contact tokens + object geometry.
 
 State vector x ∈ R^{X_DIM}:
     x = [rot6d (96), trans_norm (3), shape (10)]
-    where trans_norm = (trans - trans_anchor) / obj_scale
+    where trans_norm = trans / obj_scale
 
 Training:  Learn velocity field v_θ(x_t, t, cond) via OT-CFM loss.
 Sampling:  Euler ODE integration from t=0 (noise) to t=1 (data).
@@ -210,41 +210,6 @@ class ConditionEncoder(nn.Module):
             )
         return self.slot_point_emb(ids)
 
-    def _build_trans_anchor(
-        self,
-        token_slots: torch.Tensor,
-        token_mask: torch.Tensor,
-        point_slot_labels: torch.Tensor | None,
-        obj_point_xyz: torch.Tensor | None,
-    ) -> torch.Tensor:
-        batch_size = token_slots.shape[0]
-        device = token_slots.device
-        if point_slot_labels is None or obj_point_xyz is None:
-            return torch.zeros(batch_size, 3, device=device, dtype=obj_point_xyz.dtype if obj_point_xyz is not None else torch.float32)
-
-        slot_ids = token_slots.clamp(min=0, max=self.num_slots - 1)
-        valid_slots = token_mask & (token_slots >= 0) & (token_slots < self.num_slots)
-        slot_weights = F.one_hot(slot_ids, num_classes=self.num_slots).to(obj_point_xyz.dtype)
-        slot_weights = slot_weights * valid_slots.unsqueeze(-1)
-        slot_weights = slot_weights.sum(dim=1)  # (B, S)
-
-        point_slot_ids = point_slot_labels.to(device=device, dtype=torch.long)
-        point_valid = (point_slot_ids >= 0) & (point_slot_ids < self.num_slots)
-        point_slot_ids = point_slot_ids.clamp(min=0, max=self.num_slots - 1)
-        point_one_hot = F.one_hot(point_slot_ids, num_classes=self.num_slots).to(obj_point_xyz.dtype)
-        point_one_hot = point_one_hot * point_valid.unsqueeze(-1)
-        counts = point_one_hot.sum(dim=1)
-        denom = counts.clamp(min=1.0).unsqueeze(-1)
-        slot_centroids = torch.einsum("bns,bnd->bsd", point_one_hot, obj_point_xyz) / denom
-        slot_present = (counts > 0).to(obj_point_xyz.dtype)
-
-        slot_weights = slot_weights * slot_present
-        fallback = slot_present
-        has_weight = slot_weights.sum(dim=-1, keepdim=True) > 0
-        slot_weights = torch.where(has_weight, slot_weights, fallback)
-        slot_denom = slot_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        return torch.einsum("bs,bsd->bd", slot_weights, slot_centroids) / slot_denom
-
     def forward(self, contact_tokens: torch.Tensor, token_mask: torch.Tensor,
                 obj_global_feat: torch.Tensor,
                 obj_point_feat: torch.Tensor | None = None,
@@ -283,7 +248,6 @@ class ConditionEncoder(nn.Module):
         else:
             spatial_kv = None
 
-        trans_anchor = self._build_trans_anchor(sl, token_mask, slot_labels, obj_point_xyz)
         if obj_pc is not None:
             obj_scale = compute_object_scale(obj_pc.to(device=obj_global_feat.device, dtype=obj_global_feat.dtype))
         else:
@@ -300,8 +264,8 @@ class ConditionEncoder(nn.Module):
             "token_mask": token_mask,
             "token_parts": hp,
             "token_slots": sl,
+            "spatial_kv": spatial_kv,
             "spatial_summary": spatial_summary,
-            "trans_anchor": trans_anchor,
             "obj_scale": obj_scale,
             "obj_point_xyz": obj_point_xyz,
         }
@@ -337,6 +301,11 @@ class PoseHeadBlock(nn.Module):
         self.cross_v = nn.Linear(D, D)
         self.cross_out = nn.Linear(D, D)
         self.cross_drop = nn.Dropout(dropout)
+        self.norm_ca_spatial = nn.LayerNorm(D)
+        self.norm_spatial_kv = nn.LayerNorm(D)
+        self.spatial_attn = nn.MultiheadAttention(
+            D, num_heads, dropout=dropout, batch_first=True
+        )
 
         self.part_attn_bias = nn.Parameter(torch.zeros(num_heads))
         self.slot_attn_bias = nn.Parameter(torch.zeros(num_heads, num_slots))
@@ -349,7 +318,8 @@ class PoseHeadBlock(nn.Module):
 
     def forward(self, h: torch.Tensor, cond_vec: torch.Tensor,
                 token_kv: torch.Tensor, token_mask: torch.Tensor,
-                part_align_mask: torch.Tensor, token_slots: torch.Tensor) -> torch.Tensor:
+                part_align_mask: torch.Tensor, token_slots: torch.Tensor,
+                spatial_kv: torch.Tensor | None = None) -> torch.Tensor:
         B, L = token_kv.shape[:2]
 
         s, sh = self.film(cond_vec).chunk(2, dim=-1)
@@ -384,6 +354,12 @@ class PoseHeadBlock(nn.Module):
         h3 = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, NUM_JOINTS, self.D)
         h3 = self.cross_out(h3)
         h = h + h3
+
+        if spatial_kv is not None:
+            h4 = self.norm_ca_spatial(h)
+            spatial_kv = self.norm_spatial_kv(spatial_kv)
+            h4, _ = self.spatial_attn(h4, spatial_kv, spatial_kv)
+            h = h + h4
 
         h = h + self.ffn(self.norm_ff(h))
         return h
@@ -444,12 +420,15 @@ class FlowTrunk(nn.Module):
         # Timestep embedding
         self.time_emb = TimestepEmbedding(D)
 
-        # Noisy state injection
+        # Noisy state injection — trans and shape are separate
         self.x_rot_proj = nn.Sequential(
             nn.Linear(6, D), nn.SiLU(), nn.Linear(D, D)
         )
-        self.x_global_proj = nn.Sequential(
-            nn.Linear(TRANS_DIM + n_betas, D), nn.SiLU(), nn.Linear(D, D)
+        self.x_trans_proj = nn.Sequential(
+            nn.Linear(TRANS_DIM, D), nn.SiLU(), nn.Linear(D, D)
+        )
+        self.x_shape_proj = nn.Sequential(
+            nn.Linear(n_betas, D), nn.SiLU(), nn.Linear(D, D)
         )
 
         # Condition projection
@@ -468,17 +447,42 @@ class FlowTrunk(nn.Module):
             nn.Linear(D, D),
         )
 
+        # Per-block trans spatial cross-attention (deep spatial reasoning for translation)
+        self.trans_spatial_blocks = nn.ModuleList()
+        for _ in range(num_blocks):
+            self.trans_spatial_blocks.append(nn.ModuleDict({
+                "norm_q": nn.LayerNorm(D),
+                "norm_kv": nn.LayerNorm(D),
+                "attn": nn.MultiheadAttention(D, num_heads, dropout=dropout, batch_first=True),
+                "film": nn.Linear(D, D * 2),
+            }))
+            nn.init.zeros_(self.trans_spatial_blocks[-1]["film"].weight)
+            nn.init.zeros_(self.trans_spatial_blocks[-1]["film"].bias)
+        self.trans_final_norm = nn.LayerNorm(D)
+
+        # Translation fuse: merge deep trans query with global state
+        self.trans_fuse = nn.Sequential(
+            nn.Linear(D * 2, D), nn.SiLU(), nn.Linear(D, D)
+        )
+
         # Velocity output heads (zero-init for stable start)
         self.vel_rot_head = nn.Linear(D, 6)
         nn.init.zeros_(self.vel_rot_head.weight)
         nn.init.zeros_(self.vel_rot_head.bias)
 
-        self.vel_global_head = nn.Sequential(
+        self.vel_trans_head = nn.Sequential(
             nn.Linear(D, D // 2), nn.SiLU(),
-            nn.Linear(D // 2, TRANS_DIM + n_betas),
+            nn.Linear(D // 2, TRANS_DIM),
         )
-        nn.init.zeros_(self.vel_global_head[-1].weight)
-        nn.init.zeros_(self.vel_global_head[-1].bias)
+        nn.init.zeros_(self.vel_trans_head[-1].weight)
+        nn.init.zeros_(self.vel_trans_head[-1].bias)
+
+        self.vel_shape_head = nn.Sequential(
+            nn.Linear(D, D // 2), nn.SiLU(),
+            nn.Linear(D // 2, n_betas),
+        )
+        nn.init.zeros_(self.vel_shape_head[-1].weight)
+        nn.init.zeros_(self.vel_shape_head[-1].bias)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: dict) -> torch.Tensor:
         """
@@ -497,12 +501,14 @@ class FlowTrunk(nn.Module):
 
         # Decompose noisy state
         rot6d_t = x_t[:, :ROT6D_POSE_DIM].reshape(B, NUM_JOINTS, 6)
-        global_t = x_t[:, ROT6D_POSE_DIM:]  # (B, TRANS_DIM + n_betas)
+        trans_t = x_t[:, ROT6D_POSE_DIM:ROT6D_POSE_DIM + TRANS_DIM]  # (B, 3)
+        shape_t = x_t[:, ROT6D_POSE_DIM + TRANS_DIM:]                # (B, n_betas)
 
-        # Embeddings
-        t_emb = self.time_emb(t)                      # (B, D)
-        rot_emb = self.x_rot_proj(rot6d_t)            # (B, 16, D)
-        global_emb = self.x_global_proj(global_t)     # (B, D)
+        # Embeddings — trans and shape encoded separately
+        t_emb = self.time_emb(t)                        # (B, D)
+        rot_emb = self.x_rot_proj(rot6d_t)              # (B, 16, D)
+        trans_emb = self.x_trans_proj(trans_t)           # (B, D)
+        shape_emb = self.x_shape_proj(shape_t)           # (B, D)
 
         # Build joint queries with noisy rot6d injection
         h = self.joint_queries.unsqueeze(0).expand(B, -1, -1)
@@ -515,19 +521,41 @@ class FlowTrunk(nn.Module):
         token_parts = cond["token_parts"]
         token_slots = cond["token_slots"]
         c_global = cond["c_global"]
+        spatial_kv = cond.get("spatial_kv", None)
 
         part_align_mask = (
             (self.joint_parts.view(1, NUM_JOINTS, 1) == token_parts.unsqueeze(1))
             & token_mask.unsqueeze(1)
         )
 
-        # cond_vec = object context + timestep + noisy global state
-        cond_vec = self.cond_proj(c_global) + t_emb + global_emb
+        # cond_vec = object context + timestep + noisy trans + noisy shape
+        cond_vec = self.cond_proj(c_global) + t_emb + trans_emb + shape_emb
 
-        # Transformer blocks
-        for blk in self.blocks:
-            h = blk(h, cond_vec, token_kv, token_mask, part_align_mask, token_slots)
+        # Parallel trans query — deep spatial reasoning for translation
+        trans_h = trans_emb.unsqueeze(1)  # (B, 1, D) — single query token
+
+        # Transformer blocks (joint queries + parallel trans query)
+        for blk, trans_blk in zip(self.blocks, self.trans_spatial_blocks):
+            h = blk(
+                h,
+                cond_vec,
+                token_kv,
+                token_mask,
+                part_align_mask,
+                token_slots,
+                spatial_kv=spatial_kv,
+            )
+            # Trans spatial cross-attention at each layer
+            if spatial_kv is not None:
+                s, sh = trans_blk["film"](cond_vec).chunk(2, dim=-1)
+                trans_h = trans_h * (1 + s.unsqueeze(1)) + sh.unsqueeze(1)
+                tq = trans_blk["norm_q"](trans_h)
+                tkv = trans_blk["norm_kv"](spatial_kv)
+                ta, _ = trans_blk["attn"](tq, tkv, tkv)
+                trans_h = trans_h + ta
+
         joint_latent = self.joint_norm(h)
+        trans_h = self.trans_final_norm(trans_h).squeeze(1)  # (B, D)
 
         # Global latent
         mask_f = token_mask.float().unsqueeze(-1)
@@ -538,12 +566,21 @@ class FlowTrunk(nn.Module):
         global_latent = self.global_proj(
             torch.cat([joint_summary, token_summary, spatial_summary], dim=-1)
         )
+        global_state = global_latent + t_emb + trans_emb + shape_emb
+
+        if spatial_kv is not None:
+            trans_latent = self.trans_fuse(
+                torch.cat([global_state, trans_h], dim=-1)
+            )
+        else:
+            trans_latent = global_state
 
         # Predict velocity
         v_rot = self.vel_rot_head(joint_latent).reshape(B, ROT6D_POSE_DIM)
-        v_global = self.vel_global_head(global_latent + t_emb + global_emb)
+        v_trans = self.vel_trans_head(trans_latent)
+        v_shape = self.vel_shape_head(global_state)
 
-        return torch.cat([v_rot, v_global], dim=-1)
+        return torch.cat([v_rot, v_trans, v_shape], dim=-1)
 
 
 # ==============================================================================
@@ -573,12 +610,27 @@ class PoseFlowModel(nn.Module):
         dropout: float = 0.1,
         num_flow_blocks: int = 8,
         slot_point_emb_dim: int = 64,
+        loss_weight_rot: float = 1.0,
+        loss_weight_trans: float = 1.0,
+        loss_weight_shape: float = 1.0,
         num_contact_types: int | None = None,   # backward compat, ignored
     ):
         super().__init__()
         del num_contact_types
         self.n_betas = n_betas
         self.x_dim = ROT6D_POSE_DIM + TRANS_DIM + n_betas
+        self.loss_weight_rot = float(loss_weight_rot)
+        self.loss_weight_trans = float(loss_weight_trans)
+        self.loss_weight_shape = float(loss_weight_shape)
+
+        total_loss_weight = (
+            self.loss_weight_rot
+            + self.loss_weight_trans
+            + self.loss_weight_shape
+        )
+        if total_loss_weight <= 0:
+            raise ValueError("loss weights must sum to a positive value.")
+        self.total_loss_weight = total_loss_weight
 
         self.cond_encoder = ConditionEncoder(
             vocab_size=vocab_size,
@@ -636,11 +688,9 @@ class PoseFlowModel(nn.Module):
                   gt_shape: torch.Tensor, cond: dict) -> torch.Tensor:
         """Pack ground truth into normalized flow state vector."""
         rot6d = aa_to_rot6d(gt_pose_aa)                 # (B, 96)
-        anchor = cond.get("trans_anchor",
-                          gt_trans.new_zeros(gt_trans.shape[0], TRANS_DIM))
         scale = cond.get("obj_scale",
                          gt_trans.new_ones(gt_trans.shape[0], 1))
-        trans_norm = (gt_trans - anchor) / scale         # (B, 3)
+        trans_norm = gt_trans / scale                   # (B, 3)
         return torch.cat([rot6d, trans_norm, gt_shape], dim=-1)
 
     def unpack_data(self, x: torch.Tensor, cond: dict) -> PoseDecoderOutput:
@@ -650,11 +700,9 @@ class PoseFlowModel(nn.Module):
         shape = x[:, ROT6D_POSE_DIM + TRANS_DIM:]
 
         pose_aa = rot6d_to_aa(rot6d)
-        anchor = cond.get("trans_anchor",
-                          trans_norm.new_zeros(trans_norm.shape[0], TRANS_DIM))
         scale = cond.get("obj_scale",
                          trans_norm.new_ones(trans_norm.shape[0], 1))
-        trans = trans_norm * scale + anchor
+        trans = trans_norm * scale
 
         return PoseDecoderOutput(pose=pose_aa, trans=trans, shape=shape)
 
@@ -694,16 +742,17 @@ class PoseFlowModel(nn.Module):
 
         v_pred = self.forward_velocity(x_t, t, cond)
 
-        # Total loss
-        loss = F.mse_loss(v_pred, v_target)
+        rot_end = ROT6D_POSE_DIM
+        trans_end = rot_end + TRANS_DIM
+        v_rot_mse = F.mse_loss(v_pred[:, :rot_end], v_target[:, :rot_end])
+        v_trans_mse = F.mse_loss(v_pred[:, rot_end:trans_end], v_target[:, rot_end:trans_end])
+        v_shape_mse = F.mse_loss(v_pred[:, trans_end:], v_target[:, trans_end:])
 
-        # Per-component MSE for monitoring
-        with torch.no_grad():
-            rot_end = ROT6D_POSE_DIM
-            trans_end = rot_end + TRANS_DIM
-            v_rot_mse = F.mse_loss(v_pred[:, :rot_end], v_target[:, :rot_end])
-            v_trans_mse = F.mse_loss(v_pred[:, rot_end:trans_end], v_target[:, rot_end:trans_end])
-            v_shape_mse = F.mse_loss(v_pred[:, trans_end:], v_target[:, trans_end:])
+        loss = (
+            self.loss_weight_rot * v_rot_mse
+            + self.loss_weight_trans * v_trans_mse
+            + self.loss_weight_shape * v_shape_mse
+        ) / self.total_loss_weight
 
         return loss, {
             "flow_loss": loss.item(),
@@ -760,6 +809,116 @@ class PoseFlowModel(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ==============================================================================
+# GrabNet-style geometric auxiliary loss for flow matching training
+# ==============================================================================
+
+def compute_geo_loss(
+    pred: PoseDecoderOutput,
+    gt_verts: torch.Tensor,
+    obj_pc: torch.Tensor,
+    mano_fn,
+    obj_normals: torch.Tensor | None = None,
+    w_vert: float = 10.0,
+    w_dist_h: float = 5.0,
+    w_dist_o: float = 5.0,
+    w_pen: float = 10.0,
+):
+    """
+    GrabNet-inspired geometric supervision on denoised samples.
+
+    Call this on one-step denoised predictions at high t (e.g. t > 0.7)
+    to provide geometric grounding without slowing down every step.
+
+    Args:
+        pred: PoseDecoderOutput from model.unpack_data()
+        gt_verts: (B, 778, 3) ground-truth hand vertices
+        obj_pc: (B, N, 3) object point cloud
+        mano_fn: callable(pose, trans, shape) -> (verts, joints)
+        obj_normals: (B, N, 3) optional, for signed distance
+        w_vert, w_dist_h, w_dist_o, w_pen: loss weights
+
+    Returns:
+        loss: scalar
+        metrics: dict
+    """
+    from models.refine import point2point_signed
+
+    def compute_vertex_normals(verts: torch.Tensor, faces) -> torch.Tensor | None:
+        if faces is None:
+            return None
+        if not torch.is_tensor(faces):
+            faces_t = torch.as_tensor(faces, device=verts.device, dtype=torch.long)
+        else:
+            faces_t = faces.to(device=verts.device, dtype=torch.long)
+        if faces_t.numel() == 0:
+            return None
+
+        v0 = verts[:, faces_t[:, 0], :]
+        v1 = verts[:, faces_t[:, 1], :]
+        v2 = verts[:, faces_t[:, 2], :]
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
+
+        normals = torch.zeros_like(verts)
+        for corner in range(3):
+            idx = faces_t[:, corner].view(1, -1, 1).expand(verts.shape[0], -1, 3)
+            normals.scatter_add_(1, idx, face_normals)
+        return F.normalize(normals, dim=-1, eps=1e-6)
+
+    pred_verts, _ = mano_fn(pred.pose, pred.trans, pred.shape)
+    mano_faces = getattr(mano_fn, "faces", None)
+    pred_hand_normals = compute_vertex_normals(pred_verts, mano_faces)
+    gt_hand_normals = compute_vertex_normals(gt_verts, mano_faces)
+
+    # Vertex reconstruction loss (weighted L1, like GrabNet loss_mesh_rec_w)
+    loss_vert = F.l1_loss(pred_verts, gt_verts)
+
+    # Signed hand/object distances. With hand and object normals we recover the
+    # GrabNet-style signed object-to-hand term instead of an unsigned proxy.
+    if obj_normals is not None:
+        o2h_signed, h2o_signed, _ = point2point_signed(
+            pred_verts, obj_pc,
+            x_normals=pred_hand_normals,
+            y_normals=obj_normals,
+        )
+        o2h_gt, h2o_gt, _ = point2point_signed(
+            gt_verts, obj_pc,
+            x_normals=gt_hand_normals,
+            y_normals=obj_normals,
+        )
+    else:
+        o2h_signed, h2o_signed, _ = point2point_signed(pred_verts, obj_pc)
+        o2h_gt, h2o_gt, _ = point2point_signed(gt_verts, obj_pc)
+
+    # h2o distance matching (like GrabNet loss_dist_h)
+    loss_dist_h = F.l1_loss(h2o_signed.abs(), h2o_gt.abs())
+
+    # o2h distance matching (like GrabNet loss_dist_o)
+    loss_dist_o = F.l1_loss(o2h_signed, o2h_gt)
+
+    # Penetration penalty: penalize negative signed distance (hand inside object)
+    if obj_normals is not None:
+        pen_depth = torch.relu(-h2o_signed)
+        loss_pen = pen_depth.mean()
+    else:
+        loss_pen = pred_verts.new_zeros(1).squeeze()
+
+    loss = (
+        w_vert * loss_vert
+        + w_dist_h * loss_dist_h
+        + w_dist_o * loss_dist_o
+        + w_pen * loss_pen
+    )
+
+    return loss, {
+        "geo_loss": loss.item(),
+        "geo_vert": loss_vert.item(),
+        "geo_dist_h": loss_dist_h.item(),
+        "geo_dist_o": loss_dist_o.item(),
+        "geo_pen": loss_pen.item(),
+    }
 
 
 # ==============================================================================

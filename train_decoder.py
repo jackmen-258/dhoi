@@ -5,8 +5,8 @@ PoseFlowModel training script.
 
 Changes from regression version:
   - Training loss: OT-CFM velocity matching (single MSE, no lambda weighting)
-  - Validation: Euler ODE sampling → geo/trs/vert metrics
-  - lambda_rot/trans/shape/vert retained ONLY for val-score checkpoint selection
+  - Validation: validation-set OT-CFM flow_loss
+  - Best checkpoint selection: lowest val/flow_loss
 
 Usage:
   python train_decoder.py --epochs 200 --batch_size 64
@@ -26,31 +26,14 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from data.token_encoder import TokenEncoder
+from grabnet.tools.train_tools import point2point_signed
 from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
-from models.pose_decoder import build_flow_model, ROT6D_POSE_DIM, TRANS_DIM
-from utils.pose_utils import aa_to_rot6d
-from utils.pose_utils import _aa_to_rotmat_stable as _aa_to_rotmat
-from utils.pose_utils import _rotmat_to_aa_stable as _rotmat_to_aa
+from models.pose_decoder import build_flow_model, ROT6D_POSE_DIM, TRANS_DIM, compute_geo_loss
 from utils.mano_utils import MANOHelper
-
-
-# ==============================================================================
-# Unified metric helpers
-# ==============================================================================
-
-def vert_l2_mm(pred_verts, gt_verts):
-    """Per-vertex L2 norm, mean over vertices, in mm."""
-    return (pred_verts - gt_verts).norm(dim=-1).mean() * 1000.0
-
-
-def trans_rmse_mm(pred_trans, gt_trans):
-    """Translation RMSE in mm."""
-    return torch.sqrt(((pred_trans - gt_trans) ** 2).mean()) * 1000.0
 
 
 # ==============================================================================
@@ -58,13 +41,18 @@ def trans_rmse_mm(pred_trans, gt_trans):
 # ==============================================================================
 
 @torch.no_grad()
-def apply_token_dropout(token_mask, drop_prob):
+def apply_token_dropout(token_mask, drop_prob, adaptive_pivot: int = 6):
     """
-    随机 drop 部分 valid contact tokens.
+    k 自适应 token dropout.
+
+    稀疏序列（k < adaptive_pivot）按比例降低 drop_prob，避免精捏等
+    短序列因过度 dropout 丢失全部语义信息。具体地：
+        effective_prob = drop_prob * min(1, k / adaptive_pivot)
 
     Args:
-        token_mask: (B, L) bool — True = 有效 token
-        drop_prob:  float — 每个 valid token 被 drop 的概率
+        token_mask:     (B, L) bool — True = 有效 token
+        drop_prob:      float — 基准 drop 概率（k >= pivot 时使用）
+        adaptive_pivot: int   — k 达到此值时使用完整 drop_prob（默认 6）
 
     Returns:
         new token_mask, 保证每个样本至少保留 1 个 valid token
@@ -75,16 +63,61 @@ def apply_token_dropout(token_mask, drop_prob):
     B, L = token_mask.shape
     mask = token_mask.clone()
 
-    # 只对 valid token 做 dropout
-    drop = torch.rand(B, L, device=mask.device) < drop_prob
+    # 按样本的有效 token 数缩放 drop 概率
+    k_per_sample = token_mask.sum(dim=1).float()                      # (B,)
+    scale = (k_per_sample / adaptive_pivot).clamp(max=1.0)            # (B,)
+    effective_prob = drop_prob * scale                                 # (B,)
+
+    # 独立 Bernoulli drop，每个样本用各自的 effective_prob
+    rand = torch.rand(B, L, device=mask.device)
+    drop = rand < effective_prob.unsqueeze(1)                         # (B, L)
     mask = mask & ~drop
 
-    # 兜底: 如果某个样本的 valid token 全被 drop 了, 恢复原始 mask
+    # 兜底: 若某样本所有 valid token 都被 drop，恢复原始 mask
     empty = ~mask.any(dim=1)
     if empty.any():
         mask[empty] = token_mask[empty]
 
     return mask
+
+
+@torch.no_grad()
+def apply_token_substitution(tokens, token_mask, sub_prob, n_semantic: int = 24):
+    """
+    随机将部分 valid token 替换为其他语义 token（模拟扩散模型的 token 预测错误）.
+
+    仅对 token_mask 中标记为有效的位置做替换，且替换后的新 token
+    保证与原 token 不同（至少尝试一次重采样）。
+
+    Args:
+        tokens:     (B, L) long — token id 序列
+        token_mask: (B, L) bool — True = 有效 token（dropout 后的 mask）
+        sub_prob:   float — 每个有效 token 被替换的概率
+        n_semantic: int   — 语义 token 数量（不含 PAD/MASK），默认 24
+
+    Returns:
+        tokens: (B, L) long — 替换后的 token 序列（mask 不变）
+    """
+    if sub_prob <= 0 or n_semantic <= 1:
+        return tokens
+
+    B, L = tokens.shape
+    tokens = tokens.clone()
+
+    # 只对 valid token 按概率替换
+    sub_mask = token_mask & (torch.rand(B, L, device=tokens.device) < sub_prob)
+    if not sub_mask.any():
+        return tokens
+
+    # 采样随机语义 token id，确保与原 token 不同
+    random_ids = torch.randint(0, n_semantic, (B, L), device=tokens.device)
+    same = random_ids == tokens
+    if same.any():
+        # 对相同的位置做一次偏移（简单去重：+1 mod n_semantic）
+        random_ids = torch.where(same, (random_ids + 1) % n_semantic, random_ids)
+
+    tokens = torch.where(sub_mask, random_ids, tokens)
+    return tokens
 
 
 # ==============================================================================
@@ -120,16 +153,16 @@ class TrainConfig:
     balanced_sampling: bool  = False
 
     # ---- augmentation ----
-    token_drop_prob: float = 0.2
+    token_drop_prob:    float = 0.2   # 基准 drop 概率（稀疏序列自动降低）
+    token_sub_prob:     float = 0.05  # valid token 被替换为随机语义 token 的概率
+    contact_thresh:     float = 0.005
 
-    # ---- flow matching ----
-    n_sample_steps: int = 20     # Euler ODE steps for validation sampling
-
-    # ---- val-score weights (NOT used for training loss) ----
-    lambda_rot:   float = 1.0
-    lambda_trans: float = 0.01
-    lambda_shape: float = 1.0
-    lambda_vert:  float = 0.02
+    # ---- geometric auxiliary loss ----
+    geo_loss_weight:   float = 1.0
+    geo_vert_weight:   float = 10.0
+    geo_dist_h_weight: float = 5.0
+    geo_dist_o_weight: float = 5.0
+    geo_pen_weight:    float = 10.0
 
     # ---- logging / save ----
     log_dir:    str = "logs/decoder"
@@ -138,6 +171,7 @@ class TrainConfig:
     val_every:  int = 1000
     save_every: int = 5000
     save_top_k: int = 5
+    early_stop_patience: int = 20
 
     # ---- resume ----
     resume: str = ""
@@ -281,12 +315,12 @@ class Trainer:
         self.global_step = 0
         self.epoch       = 0
         self.best_val    = float("inf")
+        self.no_improve_evals = 0
 
         self._set_seed(cfg.seed)
         os.makedirs(cfg.save_dir, exist_ok=True)
         os.makedirs(cfg.log_dir,  exist_ok=True)
         self._setup_logging()
-
         self.mano = MANOHelper(
             mano_assets_root=cfg.mano_assets_root,
             device=str(self.device))
@@ -402,22 +436,16 @@ class Trainer:
         self.logger.info(f"  State dim:     {self.model.x_dim} "
                          f"(rot6d={ROT6D_POSE_DIM} + trans={TRANS_DIM} + shape={cfg.n_betas})")
         self.logger.info(f"  Vocab size:    {cfg.vocab_size}")
-        self.logger.info(f"  Token drop:    p={cfg.token_drop_prob}")
-        self.logger.info(f"  ODE steps:     {cfg.n_sample_steps} (val sampling)")
-        self.logger.info(f"  Val-score λ:   rot={cfg.lambda_rot}  trans={cfg.lambda_trans}  "
-                         f"shape={cfg.lambda_shape}  vert={cfg.lambda_vert}")
+        self.logger.info(
+            f"  Token aug:     drop_p={cfg.token_drop_prob} (k-adaptive, pivot=6)  "
+            f"sub_p={cfg.token_sub_prob}"
+        )
+        self.logger.info(f"  Contact eval:  thresh={cfg.contact_thresh * 1000:.1f}mm")
+        self.logger.info(f"  Geo aux:       weight={cfg.geo_loss_weight}")
+        self.logger.info(f"  Early stop:    patience={cfg.early_stop_patience}")
         self.logger.info(f"  Train:         {len(self.train_ds)} samples, "
                          f"{len(self.train_dl)} steps/epoch")
         self.logger.info("=" * 60)
-
-    def _compute_val_score(self, val: Dict[str, float]) -> float:
-        cfg = self.cfg
-        return (
-            cfg.lambda_rot * val.get("val/geo_rad", 0.0)
-            + cfg.lambda_trans * val.get("val/trs_mm", 0.0)
-            + cfg.lambda_shape * val.get("val/shape", 0.0)
-            + cfg.lambda_vert * val.get("val/vert_mm", 0.0)
-        )
 
     # ================================================================
     # Encode
@@ -459,8 +487,15 @@ class Trainer:
         gt_shape = batch["hand_shape"].to(self.device)
 
         # ---- Augmentation ----
+        # 1. k 自适应 dropout（先 drop，再 sub，避免替换已删除位置）
         if cfg.token_drop_prob > 0:
             t_mask = apply_token_dropout(t_mask, cfg.token_drop_prob)
+        # 2. token 替换（模拟扩散模型 token 预测错误）
+        if cfg.token_sub_prob > 0:
+            tokens = apply_token_substitution(
+                tokens, t_mask, cfg.token_sub_prob,
+                n_semantic=cfg.vocab_size - 2,  # 去掉 PAD 和 MASK
+            )
 
         # ---- Object point encode ----
         obj_global_feat, obj_point_feat, obj_point_xyz, fps_indices = self._encode_obj(
@@ -480,6 +515,40 @@ class Trainer:
 
         x_data = self.model.pack_data(gt_pose, gt_trans, gt_shape, cond)
         loss, metrics = self.model.compute_loss(x_data, cond)
+        metrics["geo_loss"] = 0.0
+        metrics["geo_loss_weighted"] = 0.0
+        metrics["geo_applied"] = 0.0
+
+        # ---- Geometric auxiliary loss ----
+        if cfg.geo_loss_weight > 0:
+            B = x_data.shape[0]
+            t_geo = torch.rand(B, device=x_data.device)          # 全区间均匀采样
+            w_t = t_geo ** 2                                     # 连续 t² 加权
+            with torch.no_grad():
+                noise_geo = torch.randn_like(x_data)
+                x_t_geo = (1.0 - t_geo.unsqueeze(-1)) * noise_geo + t_geo.unsqueeze(-1) * x_data
+
+            v_geo = self.model.forward_velocity(x_t_geo, t_geo, cond)
+            x_denoised = x_t_geo + v_geo * (1.0 - t_geo).unsqueeze(-1)
+            pred_geo = self.model.unpack_data(x_denoised, cond)
+
+            gt_verts = batch["hand_verts"].to(self.device)
+            geo_loss, geo_metrics = compute_geo_loss(
+                pred_geo, gt_verts, obj_pc, self.mano, obj_normals=obj_vn,
+                w_vert=cfg.geo_vert_weight,
+                w_dist_h=cfg.geo_dist_h_weight,
+                w_dist_o=cfg.geo_dist_o_weight,
+                w_pen=cfg.geo_pen_weight,
+            )
+            # w_t 按样本加权（不再是 batch 平均）
+            weighted_geo = cfg.geo_loss_weight * (w_t.mean() * geo_loss)
+            loss = loss + weighted_geo
+            metrics.update(geo_metrics)
+
+            metrics["geo_loss_weighted"] = float(weighted_geo.item())
+            metrics["geo_applied"] = 1.0
+
+        metrics["loss_total"] = float(loss.item())
 
         loss.backward()
         if cfg.max_grad_norm > 0:
@@ -492,7 +561,7 @@ class Trainer:
         return metrics
 
     # ================================================================
-    # Validation — ODE sampling + full metric computation
+    # Validation — Flow Matching loss on validation set
     # ================================================================
 
     @torch.no_grad()
@@ -524,25 +593,24 @@ class Trainer:
                 slot_labels=slot_labels_128,
                 obj_pc=obj_pc,
             )
-            out = self.model.sample(cond, n_steps=self.cfg.n_sample_steps)
-
             B = gt_pose.shape[0]
+            x_data = self.model.pack_data(gt_pose, gt_trans, gt_shape, cond)
+            _, metrics = self.model.compute_loss(x_data, cond)
+            pred = self.model.sample(cond, n_steps=20)
+            pred_verts, _ = self.mano(pred.pose, pred.trans, pred.shape)
 
-            from models.loss import geodesic_loss
-            geo_rad = geodesic_loss(
-                out.pose.view(B, -1, 3), gt_pose.view(B, -1, 3))
-            trs_mm = trans_rmse_mm(out.trans, gt_trans)
+            _, h2o_signed, _ = point2point_signed(
+                pred_verts, obj_pc, y_normals=obj_vn
+            )
+            pen_depth = torch.relu(-h2o_signed)
+            contact_mask = h2o_signed.abs() < self.cfg.contact_thresh
+            sample_has_contact = contact_mask.any(dim=1).float()
 
-            pred_verts, _ = self.mano(out.pose, out.trans, out.shape)
-            gt_verts, _   = self.mano(gt_pose, gt_trans, gt_shape)
-            v_mm = vert_l2_mm(pred_verts, gt_verts)
-
-            l_shape = F.mse_loss(out.shape, gt_shape)
-
-            totals["geo_rad"]  += geo_rad.item() * B
-            totals["trs_mm"]   += trs_mm.item() * B
-            totals["shape"]    += l_shape.item() * B
-            totals["vert_mm"]  += v_mm.item() * B
+            for k, v in metrics.items():
+                totals[k] += float(v) * B
+            totals["pen_depth_mm"] += pen_depth.mean().item() * 1000.0 * B
+            totals["pen_ratio"] += (h2o_signed < 0).float().mean().item() * B
+            totals["contact_rate"] += sample_has_contact.mean().item() * B
             n += B
 
         self.model.train()
@@ -564,7 +632,7 @@ class Trainer:
             "epoch":       self.epoch,
             "global_step": self.global_step,
             "best_val":    self.best_val,
-            "best_score":  self.best_val,
+            "no_improve_evals": self.no_improve_evals,
             "config":      self.cfg.__dict__,
         }, path)
         self.logger.info(f"  Saved: {path}")
@@ -578,7 +646,8 @@ class Trainer:
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.epoch       = ckpt.get("epoch", 0)
         self.global_step = ckpt.get("global_step", 0)
-        self.best_val    = ckpt.get("best_score", ckpt.get("best_val", float("inf")))
+        self.best_val    = ckpt.get("best_val", ckpt.get("best_score", float("inf")))
+        self.no_improve_evals = ckpt.get("no_improve_evals", 0)
         self.logger.info(f"  Resumed: epoch={self.epoch}, step={self.global_step}")
 
     def _cleanup_checkpoints(self):
@@ -598,25 +667,30 @@ class Trainer:
         self.model.train()
         self.obj_enc.train()
         self.logger.info(f"\nStart training: {cfg.epochs} epochs")
+        should_stop = False
 
         for ep in range(self.epoch, cfg.epochs):
             self.epoch = ep
             self.logger.info(f"Epoch {ep}/{cfg.epochs}")
 
-            epoch_loss = 0.0
-            n_steps    = 0
-            t0         = time.time()
+            epoch_flow_loss = 0.0
+            epoch_total_loss = 0.0
+            n_steps = 0
+            t0 = time.time()
 
             for batch in self.train_dl:
                 log = self._train_step(batch)
                 self.global_step += 1
                 n_steps += 1
-                epoch_loss += log["flow_loss"]
+                epoch_flow_loss += log["flow_loss"]
+                epoch_total_loss += log["loss_total"]
 
                 if self.global_step % cfg.log_every == 0:
                     self.logger.info(
                         f"  S{self.global_step:06d}  "
+                        f"total={log['loss_total']:.4f}  "
                         f"flow={log['flow_loss']:.4f}  "
+                        f"geo={log['geo_loss_weighted']:.4f}  "
                         f"v_rot={log['v_rot']:.4f}  "
                         f"v_trans={log['v_trans']:.4f}  "
                         f"v_shape={log['v_shape']:.4f}")
@@ -629,39 +703,64 @@ class Trainer:
                 if self.global_step % cfg.val_every == 0:
                     val = self._validate()
                     if val:
-                        vg = val.get("val/geo_rad", float("inf"))
-                        vt = val.get("val/trs_mm", 0)
-                        vv = val.get("val/vert_mm", float("inf"))
-                        vs = self._compute_val_score(val)
+                        vf = val.get("val/flow_loss", float("inf"))
 
                         self.logger.info(
                             f"  [VAL]    "
-                            f"geo={vg:.3f}rad  "
-                            f"trs={vt:.1f}mm  "
-                            f"vert={vv:.1f}mm  "
-                            f"score={vs:.4f}")
+                            f"flow={vf:.4f}  "
+                            f"v_rot={val.get('val/v_rot', 0.0):.4f}  "
+                            f"v_trans={val.get('val/v_trans', 0.0):.4f}  "
+                            f"v_shape={val.get('val/v_shape', 0.0):.4f}  "
+                            f"contact={val.get('val/contact_rate', 0.0):.3f}  "
+                            f"pen={val.get('val/pen_depth_mm', 0.0):.2f}mm")
 
                         if self.tb:
                             for k, v in val.items():
                                 self.tb.add_scalar(k, v, self.global_step)
-                            self.tb.add_scalar("val/score", vs, self.global_step)
 
-                        if vs < self.best_val:
-                            self.best_val = vs
+                        val_score = vf + 0.5 * val.get('val/pen_depth_mm', 0.0) / 100.0 - val.get('val/contact_rate', 0.0)
+                        if val_score < self.best_val:
+                            self.best_val = val_score
+                            self.no_improve_evals = 0
                             self._save_checkpoint("best")
                             self.logger.info(
-                                f"  * New best: score={vs:.4f}  "
-                                f"geo={vg:.3f}rad  trs={vt:.1f}mm  vert={vv:.1f}mm")
+                                f"  * New best: flow={vf:.4f}  "
+                                f"v_rot={val.get('val/v_rot', 0.0):.4f}  "
+                                f"v_trans={val.get('val/v_trans', 0.0):.4f}  "
+                                f"v_shape={val.get('val/v_shape', 0.0):.4f}  "
+                                f"contact={val.get('val/contact_rate', 0.0):.3f}  "
+                                f"pen={val.get('val/pen_depth_mm', 0.0):.2f}mm")
+                        else:
+                            self.no_improve_evals += 1
+                            remaining = max(cfg.early_stop_patience - self.no_improve_evals, 0)
+                            self.logger.info(
+                                f"  [EARLY STOP] no improvement for {self.no_improve_evals}/"
+                                f"{cfg.early_stop_patience} validation checks "
+                                f"(best_score={self.best_val:.4f}, cur_score={val_score:.4f}, "
+                                f"flow={vf:.4f}, remaining={remaining})"
+                            )
+                            if self.no_improve_evals >= cfg.early_stop_patience:
+                                self.logger.info(
+                                    f"Early stopping triggered at epoch={self.epoch}, "
+                                    f"step={self.global_step}."
+                                )
+                                should_stop = True
 
                 if self.global_step % cfg.save_every == 0:
                     self._save_checkpoint("latest")
                     self._save_checkpoint(f"step_{self.global_step:07d}")
                     self._cleanup_checkpoints()
 
+                if should_stop:
+                    break
+
             dt = time.time() - t0
             self.logger.info(
                 f"  Epoch {ep} done  {dt:.0f}s  "
-                f"avg_flow_loss={epoch_loss / max(n_steps, 1):.4f}")
+                f"avg_total_loss={epoch_total_loss / max(n_steps, 1):.4f}  "
+                f"avg_flow_loss={epoch_flow_loss / max(n_steps, 1):.4f}")
+            if should_stop:
+                break
 
         self._save_checkpoint("final")
         self.logger.info("Training complete.")
@@ -686,19 +785,17 @@ def parse_args():
 
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=64)
-    p.add_argument("--lr",           type=float, default=1e-4)
-    p.add_argument("--n_sample_steps", type=int, default=20)
-
-    # Val-score weights (not used for training loss)
-    p.add_argument("--lambda_rot",   type=float, default=1.0)
-    p.add_argument("--lambda_trans", type=float, default=0.01)
-    p.add_argument("--lambda_shape", type=float, default=1.0)
-    p.add_argument("--lambda_vert",  type=float, default=0.02)
-
-    p.add_argument("--resume",       type=str, default="")
-    p.add_argument("--save_dir",     type=str, default="checkpoints/decoder")
-    p.add_argument("--log_dir",      type=str, default="logs/decoder")
-    p.add_argument("--seed",         type=int, default=7725)
+    p.add_argument("--lr",              type=float, default=1e-4)
+    p.add_argument("--resume",          type=str,   default="")
+    p.add_argument("--save_dir",        type=str,   default="checkpoints/decoder")
+    p.add_argument("--log_dir",         type=str,   default="logs/decoder")
+    p.add_argument("--seed",            type=int,   default=7725)
+    p.add_argument("--token_drop_prob", type=float, default=0.2,
+                   help="基准 token dropout 概率（k 自适应，稀疏序列自动降低）")
+    p.add_argument("--token_sub_prob",  type=float, default=0.05,
+                   help="token 替换增强概率（模拟扩散模型 token 预测错误）")
+    p.add_argument("--contact_thresh",  type=float, default=0.005,
+                   help="验证时判断 contact 的距离阈值（米），默认 5mm")
     p.add_argument(
         "--balanced_sampling",
         action="store_true",
@@ -721,16 +818,14 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        n_sample_steps=args.n_sample_steps,
-        lambda_rot=args.lambda_rot,
-        lambda_trans=args.lambda_trans,
-        lambda_shape=args.lambda_shape,
-        lambda_vert=args.lambda_vert,
         resume=args.resume,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         seed=args.seed,
         balanced_sampling=args.balanced_sampling,
+        token_drop_prob=args.token_drop_prob,
+        token_sub_prob=args.token_sub_prob,
+        contact_thresh=args.contact_thresh,
     )
     Trainer(cfg).train()
 

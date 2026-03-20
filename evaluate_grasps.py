@@ -6,7 +6,7 @@ evaluate_grasps.py — 评估生成抓握的物理质量
   - Penetration Depth (cm):       手穿入物体的深度, 越低越好
   - Intersection Volume (cm³):    手-物体交叉体积, 越低越好
   - Simulation Displacement (cm): 物理仿真中物体位移, 越低越好
-  - Contact Ratio:                有接触的样本比例, 越高越好
+  - Contact Ratio:                近表面接触样本比例, 越高越好
 
 依赖:
   - lib.metrics.penetration      (穿透深度)
@@ -23,11 +23,13 @@ import os
 import argparse
 import pickle
 import logging
+import warnings
 from collections import defaultdict
 
 import numpy as np
 import trimesh
 from joblib import Parallel, delayed
+from scipy.spatial import cKDTree
 
 from metrics.basic_metric import AverageMeter
 from metrics.penetration import penetration
@@ -115,6 +117,37 @@ def check_obj_vox(obj_vox, sample_id: str) -> tuple[bool, str]:
 
 def _log_skip(sample_id: str, reason: str):
     logger.warning(f"  [{sample_id}] Skipping: {reason}")
+
+
+def min_surface_distance(obj_mesh: trimesh.Trimesh, query_points: np.ndarray) -> float:
+    """
+    计算点集到物体表面的最小距离（米）。
+
+    优先使用 trimesh.proximity.closest_point 的精确表面距离；
+    若 trimesh proximity 依赖缺失或失败，则退化为物体顶点 KDTree 最近邻距离。
+    """
+    query_points = np.asarray(query_points, dtype=np.float32)
+
+    if len(obj_mesh.faces) > 0:
+        try:
+            # trimesh.closest_point 在退化三角形上可能触发 RuntimeWarning；
+            # 这类样本直接退化到 KDTree 顶点最近邻，避免评估刷屏。
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", category=RuntimeWarning)
+                _, dist, _ = trimesh.proximity.closest_point(obj_mesh, query_points)
+            dist = np.asarray(dist, dtype=np.float32)
+            if dist.size > 0 and np.all(np.isfinite(dist)):
+                return float(dist.min())
+        except Exception:
+            pass
+
+    verts = np.asarray(obj_mesh.vertices, dtype=np.float32)
+    if verts.size == 0:
+        return float("inf")
+    tree = cKDTree(verts)
+    dist, _ = tree.query(query_points)
+    dist = np.asarray(dist, dtype=np.float32)
+    return float(dist.min()) if dist.size > 0 else float("inf")
 
 
 # ==============================================================================
@@ -220,7 +253,7 @@ class GraspResultLoader:
 # 单样本评估
 # ==============================================================================
 
-def evaluate_single_grasp(idx, loader, sims_dir):
+def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh):
     """
     评估单个抓握: penetration + intersection + simulation
 
@@ -319,12 +352,24 @@ def evaluate_single_grasp(idx, loader, sims_dir):
         _log_skip(sample_id, f"simulation returned non-finite: {sims_disp}")
         return None
 
+    try:
+        min_contact_dist = min_surface_distance(obj_wt, hand_verts)
+    except Exception as e:
+        _log_skip(sample_id, f"surface contact distance failed: {e}")
+        return None
+
+    if not np.isfinite(min_contact_dist):
+        _log_skip(sample_id, f"surface contact distance returned non-finite: {min_contact_dist}")
+        return None
+
     return {
         "sample_id": sample_id,
         "obj_id":    item["obj_id"],
         "pentr_dep": float(pentr_dep),
         "pentr_vol": float(pentr_vol),
         "sims_disp": float(sims_disp),
+        "min_contact_dist": float(min_contact_dist),
+        "near_contact": bool(min_contact_dist <= contact_thresh),
     }
 
 
@@ -343,8 +388,10 @@ def evaluate(args):
     n_total = len(loader)
     logger.info(f"Evaluating {n_total} grasps (n_jobs={args.n_jobs})...")
 
+    # 近表面接触阈值（米）：
+    # 以 hand vertex 到 object watertight surface 的最小距离定义接触。
     tasks = [
-        delayed(evaluate_single_grasp)(i, loader, sims_dir)
+        delayed(evaluate_single_grasp)(i, loader, sims_dir, args.contact_thresh)
         for i in range(n_total)
     ]
     raw_results = Parallel(n_jobs=args.n_jobs, verbose=10)(tasks)
@@ -362,6 +409,7 @@ def evaluate(args):
     pentr_vol_meter = AverageMeter("pentr_vol")
     sims_disp_meter = AverageMeter("sims_disp")
     sims_disp_list  = []
+    min_contact_dist_meter = AverageMeter("min_contact_dist")
     contact_count   = 0
 
     for r in valid:
@@ -369,7 +417,8 @@ def evaluate(args):
         pentr_vol_meter.update(r["pentr_vol"])
         sims_disp_meter.update(r["sims_disp"])
         sims_disp_list.append(r["sims_disp"])
-        if r["pentr_vol"] > 0:
+        min_contact_dist_meter.update(r["min_contact_dist"])
+        if r["near_contact"]:
             contact_count += 1
 
     n_valid        = len(valid)
@@ -382,6 +431,7 @@ def evaluate(args):
     pentr_vol_cm3 = pentr_vol_meter.avg * s3
     sims_disp_cm  = sims_disp_meter.avg * s
     sims_disp_std = float(np.std(sims_disp_list)) * s if sims_disp_list else 0.0
+    min_contact_dist_mm = min_contact_dist_meter.avg * 1000.0
 
     # ---- 保存详细结果 ----
     with open(os.path.join(eval_dir, "eval_results.pkl"), "wb") as f:
@@ -399,7 +449,8 @@ def evaluate(args):
     print(f"  Penetration Depth (cm):  {pentr_dep_cm:.6f}")
     print(f"  Intersection Vol (cm³):  {pentr_vol_cm3:.6f}")
     print(f"  Sim Displacement (cm):   {sims_disp_cm:.6f} ± {sims_disp_std:.6f}")
-    print(f"  Contact Ratio:           {contact_ratio:.4f}")
+    print(f"  Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}")
+    print(f"  Min Surface Dist (mm):   {min_contact_dist_mm:.6f}")
     print(f"{sep}")
 
     # ---- 保存文本报告 ----
@@ -412,7 +463,8 @@ def evaluate(args):
         f.write(f"Intersection Volume (mean, cm³): {pentr_vol_cm3:.6f}\n")
         f.write(f"Sim Displacement (mean, cm):     {sims_disp_cm:.6f}\n")
         f.write(f"Sim Displacement (std, cm):      {sims_disp_std:.6f}\n")
-        f.write(f"Contact Ratio:                   {contact_ratio:.4f}\n")
+        f.write(f"Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}\n")
+        f.write(f"Min Surface Dist (mean, mm):     {min_contact_dist_mm:.6f}\n")
 
     logger.info(f"Results saved to: {eval_dir}")
 
@@ -429,6 +481,8 @@ if __name__ == "__main__":
                         default="cache/OakInkShape_object_process",
                         help="Preprocessed objects dir (watertight/ voxel/ vhacd/)")
     parser.add_argument("--n_jobs",   type=int, default=8)
+    parser.add_argument("--contact_thresh", type=float, default=0.005,
+                        help="Near-surface contact threshold in meters (default: 0.005 = 5mm)")
     parser.add_argument("-g", "--gpu_id", type=str, default="0")
     args = parser.parse_args()
 

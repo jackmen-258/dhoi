@@ -17,17 +17,18 @@ import time
 import random
 import argparse
 import logging
-from collections import defaultdict
+
 from dataclasses import dataclass
 from typing import Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
 from data.token_encoder import TokenEncoder
+from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.token_denoiser import build_denoiser
 from models.discrete_diffusion import AbsorbingDiffusion
@@ -69,7 +70,6 @@ class TrainConfig:
     weight_decay:      float = 0.01
     warmup_steps:      int   = 2000
     max_grad_norm:     float = 1.0
-    balanced_sampling: bool  = False
 
     # ---- AMP ----
     use_amp: bool = True
@@ -296,19 +296,6 @@ class DiffusionTrainer:
 
         sampler = None
         shuffle = True
-        if cfg.balanced_sampling:
-            cate_counts = defaultdict(int)
-            for s in self.train_ds.samples:
-                cate_counts[s["cate_id"]] += 1
-            weights = [
-                1.0 / math.sqrt(cate_counts[s["cate_id"]])
-                for s in self.train_ds.samples
-            ]
-            sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-            shuffle = False
-            self.logger.info(
-                f"Balanced sampling: sqrt-inverse over {len(cate_counts)} categories"
-            )
 
         self.train_dl = DataLoader(
             self.train_ds,
@@ -377,7 +364,8 @@ class DiffusionTrainer:
 
         obj_pc = batch["obj_pc"].to(self.device)
         obj_vn = batch["obj_vn"].to(self.device)
-        obj_input = torch.cat([obj_pc, obj_vn], dim=-1)
+        obj_pc_norm, _ = normalize_object_points(obj_pc)
+        obj_input = torch.cat([obj_pc_norm, obj_vn], dim=-1)
         obj_global_feat, obj_point_feat, _ = self.obj_enc(obj_input)
 
         cond = {
@@ -631,11 +619,6 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--seed", type=int, default=7725)
-    p.add_argument(
-        "--balanced_sampling",
-        action="store_true",
-        help="使用 1/sqrt(category_count) 的弱类别均衡采样",
-    )
 
     p.add_argument("--vocab_size", type=int, default=26)
     p.add_argument("--pad_token_id", type=int, default=24)
@@ -663,7 +646,6 @@ def main():
         lr=args.lr,
         resume=args.resume,
         seed=args.seed,
-        balanced_sampling=args.balanced_sampling,
         vocab_size=args.vocab_size,
         pad_token_id=args.pad_token_id,
         mask_token_id=args.mask_token_id,

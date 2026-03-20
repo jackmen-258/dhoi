@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-generate_grasps.py (v14 — Point Encoder Inference)
+generate_grasps.py (v16 — GrabNet-style CVAE Decoder)
 从物体点云生成抓握姿态
 
 架构:
-  双 PointNet2Encoder
   Stage 1: diffusion_obj_enc + token denoiser → contact tokens
-  Stage 2: decoder_obj_enc + pose decoder → pose + trans + shape
+  Stage 2: BPS + token_cond → CoarseNet CVAE → pose + trans (no shape)
 """
 
 import os
@@ -24,7 +23,7 @@ from tqdm import tqdm
 from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.token_denoiser import build_denoiser
-from models.pose_decoder import build_pose_model
+from models.pose_decoder import build_grab_model
 from models.discrete_diffusion import AbsorbingDiffusion
 from models.clip_encoder import CLIPTextEncoder
 from utils.mano_utils import MANOHelper
@@ -54,6 +53,13 @@ def load_test_data(args):
     oi.n_samples = args.n_pc_points
     logger.info(f"OIShape [{args.split}]: {len(oi)} samples")
     return oi
+
+
+def build_generation_indices(oi):
+    n_items = len(oi)
+
+    return list(range(n_items))
+
 
 
 def load_models(args, device):
@@ -106,46 +112,34 @@ def load_models(args, device):
     dec_state = torch.load(args.decoder_ckpt, map_location=device)
     dec_cfg = dec_state.get("config", {})
 
-    decoder = build_pose_model(
+    # Detect use_slot_bps from checkpoint
+    use_slot_bps = dec_state.get("use_slot_bps",
+                                  dec_cfg.get("use_slot_bps", args.use_slot_bps))
+
+    decoder = build_grab_model(
         dec_cfg.get("model_config", args.decoder_config),
         vocab_size=dec_cfg.get("vocab_size", vocab_size),
-        obj_global_dim=dec_cfg.get("obj_global_dim", obj_global_dim),
-        obj_point_dim=dec_cfg.get("obj_point_dim", obj_point_dim),
-        obj_xyz_dim=dec_cfg.get("obj_xyz_dim", args.obj_xyz_dim),
         n_betas=dec_cfg.get("n_betas", args.n_betas),
+        use_slot_bps=use_slot_bps,
     ).to(device)
     decoder.load_state_dict(dec_state["model"])
+    logger.info(f"  Decoder use_slot_bps={use_slot_bps}")
 
-    decoder_obj_enc = PointNet2Encoder(
-        in_dim=6,
-        global_dim=dec_cfg.get("obj_global_dim", obj_global_dim),
-        point_dim=dec_cfg.get("obj_point_dim", obj_point_dim),
-    ).to(device)
-
-    if "obj_enc" in dec_state:
-        decoder_obj_enc.load_state_dict(dec_state["obj_enc"])
-        logger.info("  Decoder obj encoder loaded from decoder checkpoint ✓")
+    # BPS basis for object encoding
+    bps_path = dec_cfg.get("bps_path", args.bps_path)
+    bps_basis = None
+    if os.path.exists(bps_path):
+        bps_basis = torch.from_numpy(np.load(bps_path)['basis']).float().to(device)
+        logger.info(f"  BPS basis loaded from {bps_path} ✓")
     else:
-        logger.warning("  obj_enc not found in decoder checkpoint, using initialized weights")
+        logger.warning(f"  BPS basis not found at {bps_path}")
 
     diffusion_obj_enc.eval()
-    decoder_obj_enc.eval()
     denoiser.eval()
     decoder.eval()
-    for model in (diffusion_obj_enc, decoder_obj_enc, denoiser, decoder):
+    for model in (diffusion_obj_enc, denoiser, decoder):
         for p in model.parameters():
             p.requires_grad = False
-
-    norm_stats_path = os.path.join(os.path.dirname(args.decoder_ckpt), "norm_stats.npz")
-    if os.path.isfile(norm_stats_path):
-        stats = np.load(norm_stats_path)
-        decoder.set_normalization(
-            torch.from_numpy(stats["mean"]).to(device),
-            torch.from_numpy(stats["std"]).to(device),
-        )
-        logger.info(f"  Norm stats loaded from {norm_stats_path}")
-    else:
-        logger.warning(f"  norm_stats.npz not found at {norm_stats_path}")
 
     clip_model = diff_cfg.get("clip_model", args.clip_model)
     clip_encoder = CLIPTextEncoder(model_name=clip_model, device=str(device))
@@ -155,31 +149,93 @@ def load_models(args, device):
 
     return {
         "diffusion_obj_enc": diffusion_obj_enc,
-        "decoder_obj_enc": decoder_obj_enc,
         "denoiser": denoiser,
         "diffusion": diffusion,
         "decoder": decoder,
+        "bps_basis": bps_basis,
         "mano": mano,
         "clip_encoder": clip_encoder,
         "pad_token_id": pad_token_id,
+        "use_slot_bps": use_slot_bps,
     }
 
 
+def _compute_bps(obj_pc, bps_basis):
+    """Compute BPS encoding for a single object point cloud.
+
+    Args:
+        obj_pc: (1, N, 3) object point cloud
+        bps_basis: (K, 3) BPS basis points (K=4096 typically)
+    Returns:
+        bps_object: (1, K) BPS distance encoding
+    """
+    from bps_torch.bps import bps_torch
+    bps = bps_torch(custom_basis=bps_basis.cpu(), device=obj_pc.device)
+    result = bps.encode(obj_pc.squeeze(0), feature_type='dists')
+    return result['dists'].reshape(1, -1)
+
+
+def load_bps_slot_cache(args, split):
+    """Load per-object BPS slot cache for inference.
+
+    Returns a dict for looking up bps_dists and bps_slot_labels by obj_id,
+    or None if cache not found.
+    """
+    slot_dir = os.path.join(args.bps_slot_cache_dir, split)
+    if not os.path.isdir(slot_dir):
+        logger.info(f"BPS slot cache not found at {slot_dir}; "
+                     f"will use SlotGrounder for inference")
+        return None
+
+    # Just store the directory path; load individual files on demand
+    logger.info(f"BPS slot cache: {slot_dir}")
+    return {"dir": slot_dir, "cache": {}}
+
+
+def get_bps_slot_data(bps_slot_cache, obj_id, device):
+    """Get per-object BPS slot data from cache.
+
+    Returns:
+        (bps_dists, bps_slot_labels) tensors, or (None, None) if not found.
+    """
+    if bps_slot_cache is None or not obj_id:
+        return None, None
+
+    cache = bps_slot_cache["cache"]
+    if obj_id not in cache:
+        npz_path = os.path.join(bps_slot_cache["dir"], f"{obj_id}.npz")
+        if os.path.exists(npz_path):
+            data = np.load(npz_path, allow_pickle=True)
+            cache[obj_id] = {
+                "bps_dists": data["bps_dists"].astype(np.float32),
+                "bps_slot_labels": data["bps_slot_labels"].astype(np.int64),
+            }
+        else:
+            cache[obj_id] = None
+
+    entry = cache.get(obj_id)
+    if entry is None:
+        return None, None
+
+    bps_dists = torch.from_numpy(entry["bps_dists"]).unsqueeze(0).to(device)
+    bps_slot_labels = torch.from_numpy(entry["bps_slot_labels"]).unsqueeze(0).to(device)
+    return bps_dists, bps_slot_labels
+
+
 @torch.no_grad()
-def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
+def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
+                    bps_dists_cached=None, bps_slot_labels_cached=None):
     diffusion_obj_enc = models["diffusion_obj_enc"]
-    decoder_obj_enc = models["decoder_obj_enc"]
     denoiser = models["denoiser"]
     diffusion = models["diffusion"]
     decoder = models["decoder"]
+    bps_basis = models["bps_basis"]
     mano = models["mano"]
+    use_slot_bps = models["use_slot_bps"]
 
-    diff_obj_input = torch.cat([obj_pc, obj_vn], dim=-1)
+    diff_obj_pc_norm, _ = normalize_object_points(obj_pc)
+    diff_obj_input = torch.cat([diff_obj_pc_norm, obj_vn], dim=-1)
     diff_obj_global_feat, diff_obj_point_feat, _ = diffusion_obj_enc(diff_obj_input)
-
-    obj_pc_norm, _ = normalize_object_points(obj_pc)
-    dec_obj_input = torch.cat([obj_pc_norm, obj_vn], dim=-1)
-    dec_obj_global_feat, dec_obj_point_feat, dec_obj_point_xyz = decoder_obj_enc(dec_obj_input)
 
     cond = {
         "obj_feat": diff_obj_global_feat,
@@ -188,6 +244,7 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
     if text_feat is not None:
         cond["text_feat"] = text_feat
 
+    # ---- Stage 1: Contact token generation ----
     result = diffusion.sample(
         denoiser,
         cond=cond,
@@ -199,14 +256,20 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
     tokens = result["samples"]
     inferred_mask = tokens != models["pad_token_id"]
 
-    pred = decoder(
-        tokens,
-        inferred_mask,
-        dec_obj_global_feat,
-        dec_obj_point_feat,
-        dec_obj_point_xyz,
-        obj_pc=obj_pc,
+    # ---- Stage 2: CVAE decoder → coarse pose ----
+    if use_slot_bps and bps_dists_cached is not None:
+        # Use cached BPS dists from slot cache (normalized per-object)
+        bps_object = bps_dists_cached
+    else:
+        bps_object = _compute_bps(obj_pc, bps_basis)
+
+    # Pass slot labels if available; otherwise SlotGrounder will predict them
+    pred = decoder.sample(
+        bps_object, tokens, inferred_mask,
+        bps_slot_labels=bps_slot_labels_cached,
     )
+
+    n_betas = pred.shape.shape[-1] if pred.shape is not None else args.n_betas
     verts, joints = mano(pred.pose, pred.trans, pred.shape)
 
     return (
@@ -222,10 +285,10 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None):
 
 
 def main():
-    parser = argparse.ArgumentParser("Generate grasps (v14, point encoder)")
+    parser = argparse.ArgumentParser("Generate grasps (v16, diffusion + CVAE decoder)")
 
-    parser.add_argument("--diffusion_ckpt", type=str, required=True)
-    parser.add_argument("--decoder_ckpt", type=str, required=True)
+    parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/diffusion/best.pt")
+    parser.add_argument("--decoder_ckpt", type=str, default="checkpoints/decoder/best.pt")
 
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--oi_category", type=str, default="all")
@@ -238,13 +301,13 @@ def main():
     parser.add_argument("--denoiser_config", type=str, default="base")
     parser.add_argument("--obj_global_dim", type=int, default=256)
     parser.add_argument("--obj_point_dim", type=int, default=256)
-    parser.add_argument("--obj_xyz_dim", type=int, default=3)
     parser.add_argument("--n_betas", type=int, default=10)
+    parser.add_argument("--bps_path", type=str, default="grabnet/configs/bps.npz")
     parser.add_argument("--text_feat_dim", type=int, default=512)
     parser.add_argument("--use_text", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--vocab_size", type=int, default=112)
-    parser.add_argument("--pad_token_id", type=int, default=108)
-    parser.add_argument("--mask_token_id", type=int, default=109)
+    parser.add_argument("--vocab_size", type=int, default=26)
+    parser.add_argument("--pad_token_id", type=int, default=24)
+    parser.add_argument("--mask_token_id", type=int, default=25)
     parser.add_argument("--seq_length", type=int, default=12)
     parser.add_argument("--num_timesteps", type=int, default=100)
     parser.add_argument("--mano_assets_root", type=str, default="assets/mano_v1_2")
@@ -252,9 +315,15 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--guidance_scale", type=float, default=2.0)
 
-    parser.add_argument("--text_cache_dir", type=str, default=None)
+    parser.add_argument("--text_cache_dir", type=str, default="cache/contact_tokens/test")
     parser.add_argument("--no_text", action="store_true")
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
+
+    # Slot-grounded BPS
+    parser.add_argument("--use_slot_bps", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable slot-grounded BPS (auto-detected from decoder ckpt)")
+    parser.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
+                        help="Per-object BPS slot cache directory")
 
     parser.add_argument("--save_dir", type=str, default="experiments/generated")
     parser.add_argument("--save_mesh", action="store_true")
@@ -308,14 +377,24 @@ def main():
 
     oi = load_test_data(args)
     n_items = len(oi)
+    generation_indices = build_generation_indices(oi)
+    n_generate = len(generation_indices)
+
+    # Load BPS slot cache for inference (per-object BPS dists + slot labels)
+    bps_slot_cache = None
+    if models["use_slot_bps"]:
+        bps_slot_cache = load_bps_slot_cache(args, args.split)
 
     logger.info("=" * 60)
     logger.info(f"  Split:           {args.split}")
-    logger.info(f"  Samples:         {n_items}")
-    logger.info(f"  PointEnc:        global={args.obj_global_dim} point={args.obj_point_dim}")
+    logger.info(f"  Source samples:  {n_items}")
+    logger.info(f"  Generate count:  {n_generate}")
+    logger.info(f"  Decoder:         GrabNet-style CVAE "
+                f"({'Slot BPS' if models['use_slot_bps'] else 'token cond'})")
     logger.info(f"  Temperature:     {args.temperature}")
     logger.info(f"  Guidance scale:  {args.guidance_scale}")
     logger.info(f"  Text condition:  {text_mode}")
+    logger.info(f"  BPS slot cache:  {'loaded' if bps_slot_cache else 'none (SlotGrounder)'}")
     logger.info(f"  Output:          {results_dir}")
     logger.info("=" * 60)
 
@@ -331,12 +410,16 @@ def main():
             logger.warning("trimesh not available, --save_mesh disabled")
             args.save_mesh = False
 
-    for si in tqdm(range(n_items), desc="Generating grasps"):
+    for gen_idx, si in enumerate(tqdm(generation_indices, desc="Generating grasps")):
         oi_sample = oi[si]
 
         obj_pc = torch.from_numpy(oi_sample["obj_verts"].astype(np.float32)).unsqueeze(0).to(device)
         obj_vn = torch.from_numpy(oi_sample["obj_vn"].astype(np.float32)).unsqueeze(0).to(device)
         obj_id = oi_sample.get("obj_id", f"obj_{si:05d}")
+
+        # BPS slot cache lookup by obj_id
+        bps_dists_cached, bps_slot_labels_cached = get_bps_slot_data(
+            bps_slot_cache, obj_id, device)
 
         if text_mode == "cache":
             text_str = idx_to_text.get(si, "no contact")
@@ -346,12 +429,15 @@ def main():
             text_str = ""
 
         hand_verts, hand_joints, mano_params, tokens = generate_single(
-            models, obj_pc, obj_vn, args, text_feat=text_feat
+            models, obj_pc, obj_vn, args, text_feat=text_feat,
+            bps_dists_cached=bps_dists_cached,
+            bps_slot_labels_cached=bps_slot_labels_cached,
         )
 
         grasp_result = {
             "obj_id": obj_id,
             "sample_idx": si,
+            "generation_idx": gen_idx,
             "hand_verts_r": hand_verts,
             "hand_joints_r": hand_joints,
             "hand_pose": mano_params["pose"],
@@ -395,9 +481,12 @@ def main():
 
     meta = {
         "args": vars(args),
+        "decoder_type": "cvae",
         "total_generated": total_generated,
         "elapsed_seconds": elapsed,
         "num_source_samples": n_items,
+        "num_generation_indices": n_generate,
+        "num_unique_source_samples": len(set(generation_indices)),
     }
     with open(os.path.join(args.save_dir, "generate_meta.json"), "w") as f:
         json.dump(meta, f, indent=2, default=str)

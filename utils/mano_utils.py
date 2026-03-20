@@ -55,6 +55,7 @@ class MANOHelper(nn.Module):
 
         # 面信息（用于 mesh 导出）
         self.faces = self.mano.th_faces.detach().cpu().numpy()
+        self.faces_tensor = self.mano.th_faces.detach().to(device).long()   # (F, 3) on device
 
         # 手指顶点分组（用于 contact loss）
         self.finger_vertex_ids = self._build_finger_groups()

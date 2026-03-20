@@ -1,14 +1,14 @@
 """
 pose_decoder.py — Slot-Grounded BPS Pose Decoder
 ==================================================
-GrabNet-style CVAE (CoarseNet) + iterative RefineNet,
-with slot-grounded BPS conditioning.
+GrabNet-style CVAE (CoarseNet) with slot-grounded BPS conditioning.
 
 Architecture:
   SlotModulatedBPS: tokens + bps_dists + bps_slot_labels → slot-aware BPS feature
   CoarseNet:  CVAE, slot_bps_feat → rot6d(96) + trans(3)
-  RefineNet:  iterative h2o-dist refinement + refine_cond
   SlotGrounder: (inference) predict bps_slot_labels from bps_dists + tokens
+
+RefineNet lives in models/refine.py (joint-trained, see train_decoder.py).
 
 No shape prediction — uses mean hand shape (following GrabNet).
 """
@@ -122,7 +122,7 @@ class SlotModulatedBPS(nn.Module):
     affine parameters, weighted by token-derived slot activation.
 
     Output: (B, out_dim) feature vector that replaces bps + token_cond
-    in CoarseNet/RefineNet.
+    in CoarseNet.
 
     Design:
       1. Per-slot affine: dist * scale[s] + bias[s]  per basis point
@@ -403,13 +403,6 @@ class CoarseNet(nn.Module):
 
     Encoder sees raw BPS + GT pose (for VAE posterior).
     Decoder sees z + slot_bps_feat (slot-grounded BPS feature from SlotModulatedBPS).
-
-    When use_slot_bps=True:
-      - Encoder input: raw bps(in_bps) + orient(9) + trans(3) = in_bps + 12
-      - Decoder input: z(latentD) + slot_bps_feat(in_bps)  [no separate cond_dim]
-
-    When use_slot_bps=False (backward compat):
-      - Decoder input: z(latentD) + bps(in_bps) + token_cond(cond_dim)
     """
 
     def __init__(
@@ -418,12 +411,9 @@ class CoarseNet(nn.Module):
         latentD: int = 16,
         in_bps: int = 4096,
         in_pose: int = 12,
-        cond_dim: int = 0,
-        use_slot_bps: bool = True,
     ):
         super().__init__()
         self.latentD = latentD
-        self.use_slot_bps = use_slot_bps
 
         # ---- Encoder: raw bps + GT pose → z ----
         enc_in = in_bps + in_pose
@@ -434,11 +424,8 @@ class CoarseNet(nn.Module):
         self.enc_var = nn.Linear(n_neurons, latentD)
         self.do = nn.Dropout(p=0.1)
 
-        # ---- Decoder: z + slot_bps_feat (or z + bps + cond) → rot6d + trans ----
-        if use_slot_bps:
-            dec_in = latentD + in_bps  # slot_bps_feat has dim in_bps
-        else:
-            dec_in = latentD + in_bps + cond_dim
+        # ---- Decoder: z + slot_bps_feat → rot6d + trans ----
+        dec_in = latentD + in_bps  # slot_bps_feat has dim in_bps
         self.dec_bn1 = nn.BatchNorm1d(in_bps)
         self.dec_rb1 = ResBlock(dec_in, n_neurons)
         self.dec_rb2 = ResBlock(n_neurons + dec_in, n_neurons)
@@ -465,24 +452,15 @@ class CoarseNet(nn.Module):
             self.enc_mu(X), F.softplus(self.enc_var(X))
         )
 
-    def decode(
-        self,
-        z: torch.Tensor,
-        bps_feat: torch.Tensor,
-        token_cond: torch.Tensor | None = None,
-    ) -> dict:
-        """Decode z + bps_feat (+ optional token_cond) → pose + trans.
+    def decode(self, z: torch.Tensor, bps_feat: torch.Tensor) -> dict:
+        """Decode z + bps_feat → pose + trans.
 
         Args:
             z: (B, latentD)
-            bps_feat: (B, in_bps) — slot_bps_feat when use_slot_bps, raw bps otherwise
-            token_cond: (B, cond_dim) — only used when use_slot_bps=False
+            bps_feat: (B, in_bps) — slot_bps_feat from SlotModulatedBPS
         """
         o_bps = self.dec_bn1(bps_feat)
-        if self.use_slot_bps or token_cond is None:
-            X0 = torch.cat([z, o_bps], dim=1)
-        else:
-            X0 = torch.cat([z, o_bps, token_cond], dim=1)
+        X0 = torch.cat([z, o_bps], dim=1)
         X = self.dec_rb1(X0, True)
         X = self.dec_rb2(torch.cat([X0, X], dim=1), True)
 
@@ -500,7 +478,6 @@ class CoarseNet(nn.Module):
         trans_rhand: torch.Tensor,
         global_orient_rhand_rotmat: torch.Tensor,
         bps_feat: torch.Tensor,
-        token_cond: torch.Tensor | None = None,
         **kwargs,
     ) -> dict:
         """Training forward: encode GT → sample z → decode.
@@ -510,11 +487,10 @@ class CoarseNet(nn.Module):
             trans_rhand: (B, 3) GT translation
             global_orient_rhand_rotmat: (B, 9) GT global orient
             bps_feat: (B, out_dim) slot-modulated BPS (for decoder)
-            token_cond: (B, cond_dim) optional legacy token cond
         """
         z_dist = self.encode(bps_raw, trans_rhand, global_orient_rhand_rotmat)
         z_s = z_dist.rsample()
-        results = self.decode(z_s, bps_feat, token_cond)
+        results = self.decode(z_s, bps_feat)
         results["mean"] = z_dist.mean
         results["std"] = z_dist.scale
         return results
@@ -523,7 +499,6 @@ class CoarseNet(nn.Module):
     def sample_poses(
         self,
         bps_feat: torch.Tensor,
-        token_cond: torch.Tensor | None = None,
         seed: int | None = None,
     ) -> dict:
         """Sample from prior: z ~ N(0, I) → decode."""
@@ -533,88 +508,7 @@ class CoarseNet(nn.Module):
         if seed is not None:
             np.random.seed(seed)
         z = torch.randn(bs, self.latentD, device=device, dtype=dtype)
-        return self.decode(z, bps_feat, token_cond)
-
-
-# ==============================================================================
-# RefineNet — iterative refinement
-# ==============================================================================
-
-class RefineNet(nn.Module):
-    """Iterative refinement (GrabNet-style).
-
-    At each iteration:
-      1. (iter > 0) Recompute h2o_dist via MANO forward pass
-      2. Predict residual pose + trans from [h2o_dist, pose, trans, refine_cond]
-      3. Accumulate: pose += delta_pose, trans += delta_trans
-    """
-
-    def __init__(
-        self,
-        in_size: int = 778 + NUM_JOINTS * 6 + 3,
-        h_size: int = 512,
-        n_iters: int = 3,
-        cond_dim: int = 512,
-    ):
-        super().__init__()
-        self.n_iters = n_iters
-        full_in = in_size + cond_dim
-
-        self.bn1 = nn.BatchNorm1d(778)
-        self.rb1 = ResBlock(full_in, h_size)
-        self.rb2 = ResBlock(full_in + h_size, h_size)
-        self.rb3 = ResBlock(full_in + h_size, h_size)
-        self.out_p = nn.Linear(h_size, NUM_JOINTS * 6)
-        self.out_t = nn.Linear(h_size, 3)
-        self.dout = nn.Dropout(0.3)
-
-    def forward(
-        self,
-        h2o_dist: torch.Tensor,
-        fpose_rhand_rotmat_f: torch.Tensor,
-        trans_rhand_f: torch.Tensor,
-        global_orient_rhand_rotmat_f: torch.Tensor,
-        verts_object: torch.Tensor,
-        refine_cond: torch.Tensor,
-        **kwargs,
-    ) -> dict:
-        bs = h2o_dist.shape[0]
-
-        if global_orient_rhand_rotmat_f.dim() == 3:
-            init_rpose = global_orient_rhand_rotmat_f[..., :2].reshape(bs, -1)
-        else:
-            init_rpose = global_orient_rhand_rotmat_f.reshape(bs, 3, 3)[..., :2].reshape(bs, -1)
-
-        if fpose_rhand_rotmat_f.dim() == 4:
-            init_fpose = fpose_rhand_rotmat_f[..., :2].reshape(bs, -1)
-        else:
-            init_fpose = fpose_rhand_rotmat_f.reshape(bs, 15, 3, 3)[..., :2].reshape(bs, -1)
-
-        init_pose = torch.cat([init_rpose, init_fpose], dim=1)
-        init_trans = trans_rhand_f
-
-        for i in range(self.n_iters):
-            if i != 0:
-                hand_parms = _parms_decode(init_pose, init_trans)
-                verts_rhand = self.rhm_train(**hand_parms).vertices
-                _, h2o_dist, _ = point2point_signed(verts_rhand, verts_object)
-
-            h2o_normed = self.bn1(h2o_dist)
-            X0 = torch.cat([h2o_normed, init_pose, init_trans, refine_cond], dim=1)
-            X = self.rb1(X0)
-            X = self.dout(X)
-            X = self.rb2(torch.cat([X, X0], dim=1))
-            X = self.dout(X)
-            X = self.rb3(torch.cat([X, X0], dim=1))
-            X = self.dout(X)
-
-            pose_delta = self.out_p(X)
-            trans_delta = self.out_t(X)
-
-            init_trans = init_trans + trans_delta
-            init_pose = init_pose + pose_delta
-
-        return _parms_decode(init_pose, init_trans)
+        return self.decode(z, bps_feat)
 
 
 # ==============================================================================
@@ -642,15 +536,12 @@ def _parms_decode(pose_rot6d: torch.Tensor, trans: torch.Tensor) -> dict:
 # ==============================================================================
 
 class PoseGrabModel(nn.Module):
-    """GrabNet-style coarse-to-fine pose decoder with slot-grounded BPS.
+    """GrabNet-style coarse pose decoder with slot-grounded BPS.
 
     Contains:
       - SlotModulatedBPS: tokens + bps_dists + bps_slot_labels → slot-aware BPS
       - SlotGrounder: predict bps_slot_labels at inference (no GT)
       - CoarseNet: CVAE, slot_bps → rot6d + trans
-      - RefineNet: iterative h2o-dist refinement
-
-    When use_slot_bps=False, falls back to ContactTokenEncoder + raw BPS.
     """
 
     def __init__(
@@ -658,16 +549,12 @@ class PoseGrabModel(nn.Module):
         vocab_size: int = 26,
         num_hand_parts: int = NUM_HAND_PARTS,
         num_slots: int = NUM_SLOTS,
-        token_embed_dim: int = 128,
         cond_dim: int = 512,
         n_neurons: int = 512,
         latentD: int = 16,
         in_bps: int = 4096,
-        h_size: int = 512,
-        n_iters: int = 3,
         n_betas: int = DEFAULT_N_BETAS,
         kl_coef: float = 0.005,
-        use_slot_bps: bool = True,
         slot_grounder_hidden: int = 256,
         **kwargs,
     ):
@@ -675,42 +562,26 @@ class PoseGrabModel(nn.Module):
         self.n_betas = n_betas
         self.kl_coef = kl_coef
         self.latentD = latentD
-        self.use_slot_bps = use_slot_bps
 
-        if use_slot_bps:
-            self.slot_bps = SlotModulatedBPS(
-                n_bps=in_bps,
-                num_slots=num_slots,
-                num_hand_parts=num_hand_parts,
-                vocab_size=vocab_size,
-                token_embed_dim=64,
-                out_dim=in_bps,
-            )
-            self.slot_grounder = SlotGrounder(
-                n_bps=in_bps,
-                num_slots=num_slots,
-                token_cond_dim=64,
-                hidden_dim=slot_grounder_hidden,
-            )
-            # Refine conditioning: project slot_bps to cond_dim for RefineNet
-            self.refine_proj = nn.Sequential(
-                nn.Linear(in_bps, cond_dim),
-                nn.LeakyReLU(0.2, inplace=True),
-            )
-            self.token_encoder = None
+        self.slot_bps = SlotModulatedBPS(
+            n_bps=in_bps,
+            num_slots=num_slots,
+            num_hand_parts=num_hand_parts,
+            vocab_size=vocab_size,
+            token_embed_dim=64,
+            out_dim=in_bps,
+        )
+        self.slot_grounder = SlotGrounder(
+            n_bps=in_bps,
+            num_slots=num_slots,
+            token_cond_dim=64,
+            hidden_dim=slot_grounder_hidden,
+        )
 
         self.coarse_net = CoarseNet(
             n_neurons=n_neurons,
             latentD=latentD,
             in_bps=in_bps,
-            cond_dim=cond_dim if not use_slot_bps else 0,
-            use_slot_bps=use_slot_bps,
-        )
-        self.refine_net = RefineNet(
-            in_size=778 + NUM_JOINTS * 6 + 3,
-            h_size=h_size,
-            n_iters=n_iters,
-            cond_dim=cond_dim,
         )
 
     # ----------------------------------------------------------------
@@ -725,12 +596,7 @@ class PoseGrabModel(nn.Module):
         token_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute slot-modulated BPS feature. (B, in_bps)"""
-        assert self.slot_bps is not None, "use_slot_bps=False"
         return self.slot_bps(bps_dists, bps_slot_labels, tokens, token_mask)
-
-    def get_refine_cond(self, slot_bps_feat: torch.Tensor) -> torch.Tensor:
-        """Project slot BPS feature to RefineNet conditioning dim."""
-        return self.refine_proj(slot_bps_feat)
 
     def predict_slot_labels(
         self,
@@ -743,24 +609,8 @@ class PoseGrabModel(nn.Module):
         Returns:
             (B, K) long, -1~num_slots-1
         """
-        assert self.slot_grounder is not None
         tok_summary = self.slot_bps._encode_token_summary(tokens, token_mask)
         return self.slot_grounder.predict(bps_dists, tok_summary)
-
-    # ----------------------------------------------------------------
-    # Legacy token encoding (backward compat)
-    # ----------------------------------------------------------------
-
-    def encode_tokens(
-        self, tokens: torch.Tensor, mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Contact tokens → fixed conditioning vector (B, cond_dim).
-        Only available when use_slot_bps=False."""
-        assert self.token_encoder is not None, (
-            "encode_tokens() not available in slot_bps mode. "
-            "Use encode_slot_bps() instead."
-        )
-        return self.token_encoder(tokens, mask)
 
     # ----------------------------------------------------------------
     # Coarse stage (CVAE)
@@ -772,7 +622,6 @@ class PoseGrabModel(nn.Module):
         slot_bps_feat: torch.Tensor,
         trans_rhand: torch.Tensor,
         global_orient_rhand_rotmat: torch.Tensor,
-        token_cond: torch.Tensor | None = None,
     ) -> dict:
         """Training forward through CoarseNet.
 
@@ -781,11 +630,10 @@ class PoseGrabModel(nn.Module):
             slot_bps_feat: (B, 4096) slot-modulated BPS (for decoder)
             trans_rhand: GT translation
             global_orient_rhand_rotmat: GT orient
-            token_cond: legacy token conditioning (use_slot_bps=False only)
         """
         return self.coarse_net(
             bps_raw, trans_rhand, global_orient_rhand_rotmat,
-            slot_bps_feat, token_cond,
+            slot_bps_feat,
         )
 
     def compute_coarse_loss(
@@ -883,18 +731,14 @@ class PoseGrabModel(nn.Module):
         B = bps_dists.shape[0]
         nb = n_betas if n_betas is not None else self.n_betas
 
-        if self.use_slot_bps:
-            # Get or predict slot labels
-            if bps_slot_labels is None:
-                bps_slot_labels = self.predict_slot_labels(bps_dists, tokens, mask)
+        # Get or predict slot labels
+        if bps_slot_labels is None:
+            bps_slot_labels = self.predict_slot_labels(bps_dists, tokens, mask)
 
-            # Compute slot-modulated BPS
-            slot_bps_feat = self.encode_slot_bps(
-                bps_dists, bps_slot_labels, tokens, mask)
-            results = self.coarse_net.sample_poses(slot_bps_feat)
-        else:
-            token_cond = self.encode_tokens(tokens, mask)
-            results = self.coarse_net.sample_poses(bps_dists, token_cond)
+        # Compute slot-modulated BPS
+        slot_bps_feat = self.encode_slot_bps(
+            bps_dists, bps_slot_labels, tokens, mask)
+        results = self.coarse_net.sample_poses(slot_bps_feat)
 
         pose_aa = results["fullpose_aa"]
         trans = results["transl"]
@@ -917,26 +761,17 @@ class PoseGrabModel(nn.Module):
         **kwargs,
     ):
         """Training forward: if GT is provided, run CVAE. Otherwise sample."""
-        if self.use_slot_bps:
-            if bps_slot_labels is None:
-                bps_slot_labels = self.predict_slot_labels(bps_dists, tokens, mask)
-            slot_bps_feat = self.encode_slot_bps(
-                bps_dists, bps_slot_labels, tokens, mask)
+        if bps_slot_labels is None:
+            bps_slot_labels = self.predict_slot_labels(bps_dists, tokens, mask)
+        slot_bps_feat = self.encode_slot_bps(
+            bps_dists, bps_slot_labels, tokens, mask)
 
-            if trans_rhand is not None and global_orient_rhand_rotmat is not None:
-                return self.forward_coarse(
-                    bps_dists, slot_bps_feat, trans_rhand,
-                    global_orient_rhand_rotmat)
-            else:
-                return self.coarse_net.sample_poses(slot_bps_feat)
+        if trans_rhand is not None and global_orient_rhand_rotmat is not None:
+            return self.forward_coarse(
+                bps_dists, slot_bps_feat, trans_rhand,
+                global_orient_rhand_rotmat)
         else:
-            token_cond = self.encode_tokens(tokens, mask)
-            if trans_rhand is not None and global_orient_rhand_rotmat is not None:
-                return self.coarse_net(
-                    bps_dists, trans_rhand, global_orient_rhand_rotmat,
-                    bps_dists, token_cond)
-            else:
-                return self.coarse_net.sample_poses(bps_dists, token_cond)
+            return self.coarse_net.sample_poses(slot_bps_feat)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1034,34 +869,150 @@ def compute_geo_loss(
 
 
 # ==============================================================================
+# Part-Contact Consistency Loss
+# ==============================================================================
+
+def build_vert_to_part(mano_fn) -> torch.Tensor:
+    """Build vertex → hand-part mapping from MANO skinning weights.
+
+    Uses MANO's linear blend skinning weights to determine the dominant
+    joint for each vertex, then maps joints to hand parts via JOINT_TO_PART.
+
+    Returns:
+        (778,) long tensor, values in [0, NUM_HAND_PARTS-1]
+    """
+    weights = mano_fn.mano.th_weights.detach().cpu()  # (778, 16)
+    dominant_joint = weights.argmax(dim=1)  # (778,)
+    jtp = torch.tensor(JOINT_TO_PART, dtype=torch.long)
+    return jtp[dominant_joint]  # (778,)
+
+
+def propagate_slot_labels(
+    obj_pc: torch.Tensor,           # (B, N, 3)
+    obj_scale: torch.Tensor,        # (B,) normalization scale
+    bps_basis: torch.Tensor,        # (4096, 3) BPS basis coordinates
+    bps_slot_labels: torch.Tensor,  # (B, 4096) slot label per basis point
+) -> torch.Tensor:
+    """Propagate BPS slot labels to object surface points via nearest BPS basis point.
+
+    Object points are normalized to BPS space using obj_scale, then for each
+    normalized point, the nearest BPS basis point is found and its slot label
+    is assigned to the object point.
+
+    Returns:
+        (B, N) long — slot labels for each surface point
+    """
+    B, N, _ = obj_pc.shape
+    device = obj_pc.device
+
+    # Normalize obj_pc to BPS space (already bbox-centered, just scale)
+    obj_norm = obj_pc / obj_scale.view(B, 1, 1).clamp(min=1e-6)
+
+    # Find nearest BPS basis point for each surface point (chunked to save memory)
+    basis = bps_basis.to(device)  # (4096, 3)
+    labels = torch.empty(B, N, dtype=torch.long, device=device)
+
+    chunk_size = 8
+    for i in range(0, B, chunk_size):
+        j = min(i + chunk_size, B)
+        dists = torch.cdist(obj_norm[i:j], basis.unsqueeze(0).expand(j - i, -1, -1))  # (chunk, N, 4096)
+        nearest_basis = dists.argmin(dim=2)  # (chunk, N)
+        labels[i:j] = torch.gather(bps_slot_labels[i:j], 1, nearest_basis)
+
+    return labels
+
+
+def compute_part_contact_loss(
+    hand_verts: torch.Tensor,       # (B, 778, 3)
+    obj_pc: torch.Tensor,           # (B, N, 3)
+    tokens: torch.Tensor,           # (B, L)
+    token_mask: torch.Tensor,       # (B, L) bool
+    vert_to_part: torch.Tensor,     # (778,) long — vertex → part_id
+    obj_slot_labels: torch.Tensor | None = None,  # (B, N) long — per-point slot labels
+    num_slots: int = NUM_SLOTS,
+) -> torch.Tensor:
+    """Part-Contact Consistency Loss.
+
+    For each contact token (part_id, slot_id):
+      - part_id's hand vertices should be close to the object
+      - If obj_slot_labels is provided: specifically close to slot_id region
+
+    This loss is differentiable through hand_verts and encourages the predicted
+    hand pose to match the contact specification from the token sequence.
+
+    Returns:
+        scalar loss (0 if no valid tokens)
+    """
+    B, L = tokens.shape
+    device = hand_verts.device
+    n_semantic = NUM_HAND_PARTS * num_slots
+
+    total_loss = hand_verts.new_zeros(())
+    n_terms = 0
+
+    # Pre-compute vert_to_part on device
+    vtp = vert_to_part.to(device)
+
+    for b in range(B):
+        for j in range(L):
+            if not token_mask[b, j]:
+                continue
+            tok = tokens[b, j].item()
+            if tok >= n_semantic:  # skip PAD/MASK
+                continue
+
+            part_id = tok // num_slots
+            slot_id = tok % num_slots
+
+            # Get hand vertices for this part
+            part_mask = (vtp == part_id)
+            part_verts = hand_verts[b, part_mask]  # (Vp, 3)
+
+            if obj_slot_labels is not None:
+                # Full consistency: part vertices → slot region on object
+                slot_mask = (obj_slot_labels[b] == slot_id)
+                target_points = obj_pc[b, slot_mask]  # (Ns, 3)
+                if target_points.shape[0] == 0:
+                    # Fallback to full surface if slot has no points
+                    target_points = obj_pc[b]
+            else:
+                target_points = obj_pc[b]  # (N, 3)
+
+            # Min distance from each part vertex to target region
+            dists = torch.cdist(part_verts, target_points)  # (Vp, Ns)
+            min_dists = dists.min(dim=1).values  # (Vp,)
+            total_loss = total_loss + min_dists.mean()
+            n_terms += 1
+
+    if n_terms > 0:
+        total_loss = total_loss / n_terms
+
+    return total_loss
+
+
+# ==============================================================================
 # Presets & builders
 # ==============================================================================
 
 _PRESETS = {
     "small": dict(
         n_neurons=256, latentD=16, cond_dim=256,
-        h_size=256, n_iters=2,
     ),
     "base": dict(
         n_neurons=512, latentD=16, cond_dim=512,
-        h_size=512, n_iters=3,
     ),
     "large": dict(
         n_neurons=768, latentD=32, cond_dim=512,
-        h_size=512, n_iters=3,
     ),
 }
 
 
-def build_grab_model(config: str = "base", use_slot_bps: bool = True, **kw) -> PoseGrabModel:
-    """Build a GrabNet-style pose decoder.
+def build_grab_model(config: str = "base", **kw) -> PoseGrabModel:
+    """Build a GrabNet-style pose decoder with slot-grounded BPS conditioning.
 
     Args:
         config: preset name ("small", "base", "large")
-        use_slot_bps: if True, use slot-grounded BPS conditioning (default).
-                      if False, use legacy ContactTokenEncoder.
     """
     params = _PRESETS[config].copy()
-    params["use_slot_bps"] = use_slot_bps
     params.update(kw)
     return PoseGrabModel(**params)

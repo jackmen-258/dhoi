@@ -112,18 +112,13 @@ def load_models(args, device):
     dec_state = torch.load(args.decoder_ckpt, map_location=device)
     dec_cfg = dec_state.get("config", {})
 
-    # Detect use_slot_bps from checkpoint
-    use_slot_bps = dec_state.get("use_slot_bps",
-                                  dec_cfg.get("use_slot_bps", args.use_slot_bps))
-
     decoder = build_grab_model(
         dec_cfg.get("model_config", args.decoder_config),
         vocab_size=dec_cfg.get("vocab_size", vocab_size),
         n_betas=dec_cfg.get("n_betas", args.n_betas),
-        use_slot_bps=use_slot_bps,
     ).to(device)
     decoder.load_state_dict(dec_state["model"])
-    logger.info(f"  Decoder use_slot_bps={use_slot_bps}")
+    logger.info("  Decoder loaded (slot-grounded BPS)")
 
     # BPS basis for object encoding
     bps_path = dec_cfg.get("bps_path", args.bps_path)
@@ -156,7 +151,7 @@ def load_models(args, device):
         "mano": mano,
         "clip_encoder": clip_encoder,
         "pad_token_id": pad_token_id,
-        "use_slot_bps": use_slot_bps,
+        "use_slot_bps": True,
     }
 
 
@@ -231,7 +226,7 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
     decoder = models["decoder"]
     bps_basis = models["bps_basis"]
     mano = models["mano"]
-    use_slot_bps = models["use_slot_bps"]
+    # slot BPS is always enabled
 
     diff_obj_pc_norm, _ = normalize_object_points(obj_pc)
     diff_obj_input = torch.cat([diff_obj_pc_norm, obj_vn], dim=-1)
@@ -257,7 +252,7 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
     inferred_mask = tokens != models["pad_token_id"]
 
     # ---- Stage 2: CVAE decoder → coarse pose ----
-    if use_slot_bps and bps_dists_cached is not None:
+    if bps_dists_cached is not None:
         # Use cached BPS dists from slot cache (normalized per-object)
         bps_object = bps_dists_cached
     else:
@@ -316,12 +311,11 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=2.0)
 
     parser.add_argument("--text_cache_dir", type=str, default="cache/contact_tokens/test")
+    parser.add_argument("--slot_cache_dir", type=str, default="cache/contact_tokens/test")
     parser.add_argument("--no_text", action="store_true")
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
 
     # Slot-grounded BPS
-    parser.add_argument("--use_slot_bps", action=argparse.BooleanOptionalAction, default=True,
-                        help="Enable slot-grounded BPS (auto-detected from decoder ckpt)")
     parser.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                         help="Per-object BPS slot cache directory")
 
@@ -381,16 +375,13 @@ def main():
     n_generate = len(generation_indices)
 
     # Load BPS slot cache for inference (per-object BPS dists + slot labels)
-    bps_slot_cache = None
-    if models["use_slot_bps"]:
-        bps_slot_cache = load_bps_slot_cache(args, args.split)
+    bps_slot_cache = load_bps_slot_cache(args, args.split)
 
     logger.info("=" * 60)
     logger.info(f"  Split:           {args.split}")
     logger.info(f"  Source samples:  {n_items}")
     logger.info(f"  Generate count:  {n_generate}")
-    logger.info(f"  Decoder:         GrabNet-style CVAE "
-                f"({'Slot BPS' if models['use_slot_bps'] else 'token cond'})")
+    logger.info(f"  Decoder:         GrabNet-style CVAE (Slot BPS)")
     logger.info(f"  Temperature:     {args.temperature}")
     logger.info(f"  Guidance scale:  {args.guidance_scale}")
     logger.info(f"  Text condition:  {text_mode}")

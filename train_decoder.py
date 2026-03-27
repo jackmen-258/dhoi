@@ -7,8 +7,8 @@ Following GrabNet's training approach, CoarseNet and RefineNet are trained
 jointly in the same epoch loop, each with their own optimizer.
 
 Architecture:
-  - CoarseNet: CVAE with slot-grounded BPS(4096) + contact token conditioning
-  - RefineNet: iterative h2o-distance refinement (from models/refine.py)
+  - CoarseNet: CVAE with raw BPS(4096) + scheme-B token conditioning
+  - RefineNet: iterative h2o-distance refinement (sub-module of PoseGrabModel)
   - Part-Contact Consistency Loss: encourages hand-part → object-slot contact
   - No shape/betas prediction (mean shape)
 
@@ -31,15 +31,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import chamfer_distance as chd
 from torch.utils.data import Dataset, DataLoader
 
 from data.token_encoder import TokenEncoder
+from models.condition_encoder import build_token_histogram
 from models.pose_decoder import (
     build_grab_model, ROT6D_POSE_DIM, TRANS_DIM, NUM_HAND_PARTS, NUM_SLOTS,
     point2point_signed, compute_geo_loss,
     build_vert_to_part, propagate_slot_labels, compute_part_contact_loss,
+    RefineNet, compute_refine_loss,
 )
-from models.refine import RefineNet, compute_refine_loss, _compute_vertex_normals
 from utils.mano_utils import MANOHelper
 from utils.pose_utils import aa_to_rot6d, rot6d_to_aa
 
@@ -99,6 +101,87 @@ def apply_token_substitution(tokens, token_mask, sub_prob, n_semantic: int = 24)
     return tokens
 
 
+@torch.no_grad()
+def recover_contact_matrix_from_obj_slots(
+    hand_verts: torch.Tensor,      # (B, 778, 3)
+    obj_pc: torch.Tensor,          # (B, N, 3)
+    obj_slot_labels: torch.Tensor, # (B, N)
+    vert_to_part: torch.Tensor,    # (778,)
+    contact_distance: float,
+    num_slots: int = NUM_SLOTS,
+) -> torch.Tensor:
+    """Recover a binary (hand_part x slot) contact matrix from a predicted grasp."""
+    device = hand_verts.device
+    B, V, _ = hand_verts.shape
+
+    ch = chd.ChamferDistance()
+    _, _, xidx_near, _ = ch(hand_verts, obj_pc)  # (B, V)
+    xidx_near = xidx_near.long()
+
+    nearest_obj = torch.gather(
+        obj_pc, 1, xidx_near.unsqueeze(-1).expand(-1, -1, 3)
+    )
+    nearest_slots = torch.gather(obj_slot_labels.long(), 1, xidx_near)
+    distances = torch.norm(hand_verts - nearest_obj, dim=-1)
+
+    contact_mask = (distances < contact_distance) & (nearest_slots >= 0)
+    part_ids = vert_to_part.to(device).view(1, V).expand(B, -1)
+
+    contact_matrix = torch.full(
+        (B, NUM_HAND_PARTS, num_slots),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+
+    for part_id in range(NUM_HAND_PARTS):
+        part_mask = part_ids == part_id
+        part_contact = contact_mask & part_mask
+        for slot_id in range(num_slots):
+            present = (part_contact & (nearest_slots == slot_id)).any(dim=1)
+            contact_matrix[present, part_id, slot_id] = 0
+
+    return contact_matrix
+
+
+@torch.no_grad()
+def compute_token_recall_f1(
+    pred_contact_matrix: torch.Tensor,  # (B, 6, 4), -1/0
+    gt_tokens: torch.Tensor,            # (B, L)
+    gt_token_mask: torch.Tensor,        # (B, L)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compare predicted contact matrix with conditioning tokens."""
+    gt_hist = build_token_histogram(
+        gt_tokens,
+        gt_token_mask,
+        n_semantic=NUM_HAND_PARTS * NUM_SLOTS,
+        binary=True,
+    )
+    pred_hist = (pred_contact_matrix.view(pred_contact_matrix.shape[0], -1) >= 0).float()
+
+    tp = (pred_hist * gt_hist).sum(dim=1)
+    pred_pos = pred_hist.sum(dim=1)
+    gt_pos = gt_hist.sum(dim=1)
+
+    recall = torch.where(
+        gt_pos > 0,
+        tp / gt_pos.clamp(min=1.0),
+        torch.zeros_like(tp),
+    )
+    precision = torch.where(
+        pred_pos > 0,
+        tp / pred_pos.clamp(min=1.0),
+        torch.zeros_like(tp),
+    )
+    denom = precision + recall
+    f1 = torch.where(
+        denom > 0,
+        2.0 * precision * recall / denom,
+        torch.zeros_like(tp),
+    )
+    return recall, f1
+
+
 # ==============================================================================
 # Config
 # ==============================================================================
@@ -110,10 +193,10 @@ class TrainConfig:
     val_cache_dir:    str = "cache/contact_tokens/val"
     config_path:      str = "configs/token_config.yaml"
     mano_assets_root: str = "assets/mano_v1_2"
-    n_pc_points:      int = 2048
+    n_pc_points:      int = 10000
     oi_category:      str = "all"
     oi_intent:        str = "all"
-    bps_path:         str = "grabnet/configs/bps.npz"
+    bps_path:         str = "configs/bps.npz"
 
     # ---- model ----
     model_config: str = "base"
@@ -121,40 +204,34 @@ class TrainConfig:
     vocab_size:   int = 26
     kl_coef:      float = 0.005
 
-    # ---- slot-grounded BPS ----
+    # ---- BPS basis / auxiliary slot supervision ----
     bps_slot_cache_dir:   str   = "cache/bps_slot"
     slot_grounder_weight: float = 1.0    # CE loss weight for SlotGrounder
 
     # ---- RefineNet (joint training) ----
-    fit_refine:     bool  = True
+    fit_refine:     bool  = True    # Joint training (GrabNet trains both together)
     refine_n_iters: int   = 3
     refine_h_size:  int   = 512
     refine_n_neurons: int = 512
-    refine_lr:      float = 5e-5
-    # RefineNet loss weights
-    w_refine_vert:    float = 5.0
-    w_refine_dist:    float = 5.0
-    w_refine_pen:     float = 100.0
-    w_refine_contact: float = 2.0
-    w_refine_reg:     float = 1.0
-    # Noise augmentation for RefineNet
-    pose_noise_std:   float = 0.02
-    trans_noise_std:  float = 0.005
+    refine_lr:      float = 5e-4    # same as CoarseNet (GrabNet uses same lr for both)
 
     # ---- Part-Contact Consistency Loss ----
-    w_part_contact: float = 1.0
+    w_part_contact: float = 10.0
 
     # ---- training ----
-    epochs:            int   = 200
-    batch_size:        int   = 64
-    lr:                float = 1e-4
-    weight_decay:      float = 0.01
+    epochs:            int   = 100
+    batch_size:        int   = 128
+    lr:                float = 5e-4    # GrabNet default: 5e-4
+    weight_decay:      float = 5e-4   # GrabNet: reg_coef = 0.0005
     warmup_steps:      int   = 1000
-    max_grad_norm:     float = 1.0
+    max_grad_norm:     float = 0.0  # 0 = disabled (GrabNet does not clip gradients)
+
+    # ---- ablation ----
+    no_token_cond:      bool  = False   # zero out tok_summary for ablation
 
     # ---- augmentation ----
-    token_drop_prob:    float = 0.2
-    token_sub_prob:     float = 0.05
+    token_drop_prob:    float = 0.0
+    token_sub_prob:     float = 0.0
     contact_thresh:     float = 0.005
 
     # ---- logging / save ----
@@ -165,6 +242,10 @@ class TrainConfig:
     save_every: int = 5000
     save_top_k: int = 5
     early_stop_patience: int = 10
+
+    # ---- best checkpoint selection ----
+    best_geom_contact_min: float = 0.90
+    best_geom_pen_mm_max:  float = 12.0
 
     # ---- resume ----
     resume: str = ""
@@ -204,10 +285,10 @@ class DecoderDataset(Dataset):
         cache_dir:   str,
         config_path: str,
         split:       str = "train",
-        n_pc_points: int = 2048,
+        n_pc_points: int = 10000,
         category:    str = "all",
         intent:      str = "all",
-        bps_path:    str = "grabnet/configs/bps.npz",
+        bps_path:    str = "configs/bps.npz",
         bps_slot_cache_dir: str = "",
     ):
         self.cache_dir = cache_dir
@@ -353,11 +434,16 @@ def _collate(batch):
 # ==============================================================================
 
 def cosine_warmup_schedule(optimizer, warmup, total):
+    total = max(int(total), 1)
+    warmup = max(0, min(int(warmup), total - 1))
+
     def fn(step):
-        if step < warmup:
-            return step / max(1, warmup)
+        step = min(int(step) + 1, total)
+        if warmup > 0 and step <= warmup:
+            return step / warmup
         p = (step - warmup) / max(1, total - warmup)
         return 0.5 * (1 + math.cos(math.pi * p))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
 
 
@@ -372,6 +458,7 @@ class Trainer:
         self.global_step = 0
         self.epoch       = 0
         self.best_val    = float("inf")
+        self.best_token_f1 = float("-inf")
         self.no_improve_evals = 0
 
         self._set_seed(cfg.seed)
@@ -445,7 +532,7 @@ class Trainer:
             self.val_dl = DataLoader(
                 val_ds, batch_size=cfg.batch_size, shuffle=False,
                 num_workers=cfg.num_workers, pin_memory=True,
-                collate_fn=_collate)
+                drop_last=True, collate_fn=_collate)
 
     def _build_model(self):
         cfg = self.cfg
@@ -454,57 +541,57 @@ class Trainer:
             vocab_size=cfg.vocab_size,
             n_betas=cfg.n_betas,
             kl_coef=cfg.kl_coef,
+            refine_n_iters=cfg.refine_n_iters,
+            refine_n_neurons=cfg.refine_n_neurons,
         ).to(self.device)
-
-        # RefineNet — joint training following GrabNet approach
-        if cfg.fit_refine:
-            self.refine_net = RefineNet(
-                n_iters=cfg.refine_n_iters,
-                h_size=cfg.refine_h_size,
-                n_neurons=cfg.refine_n_neurons,
-            ).to(self.device)
-        else:
-            self.refine_net = None
+        if cfg.no_token_cond:
+            self.model.no_token_cond = True
 
     def _build_optimizer(self):
         cfg = self.cfg
-        # CoarseNet optimizer
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=cfg.lr,
-            weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        total_steps = max(cfg.epochs * len(self.train_dl), 1)
 
-        total = cfg.epochs * len(self.train_dl)
+        # CoarseNet + TokenEncoder + SlotGrounder params (exclude refine_net)
+        coarse_params = [p for n, p in self.model.named_parameters()
+                         if not n.startswith("refine_net.")]
+        self.optimizer = torch.optim.Adam(
+            coarse_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.scheduler = cosine_warmup_schedule(
-            self.optimizer, cfg.warmup_steps, total)
+            self.optimizer, cfg.warmup_steps, total_steps,
+        )
+        for group, base_lr in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
+            group["lr"] = base_lr * self.scheduler.lr_lambdas[0](0)
 
         # RefineNet optimizer (separate, following GrabNet)
-        if self.refine_net is not None:
-            self.optimizer_refine = torch.optim.AdamW(
-                self.refine_net.parameters(), lr=cfg.refine_lr,
-                weight_decay=cfg.weight_decay, betas=(0.9, 0.99))
+        if cfg.fit_refine:
+            self.optimizer_refine = torch.optim.Adam(
+                self.model.refine_net.parameters(), lr=cfg.refine_lr,
+                weight_decay=cfg.weight_decay)
             self.scheduler_refine = cosine_warmup_schedule(
-                self.optimizer_refine, cfg.warmup_steps, total)
+                self.optimizer_refine, cfg.warmup_steps, total_steps,
+            )
+            for group, base_lr in zip(self.optimizer_refine.param_groups, self.scheduler_refine.base_lrs):
+                group["lr"] = base_lr * self.scheduler_refine.lr_lambdas[0](0)
         else:
             self.optimizer_refine = None
             self.scheduler_refine = None
 
     def _load_loss_assets(self):
         """Load vertex weights and edge pairs for GrabNet-style loss."""
-        import mano as mano_pkg
         cfg = self.cfg
 
-        # MANO faces for Meshes
-        with torch.no_grad():
-            rhm = mano_pkg.load(
-                model_path=os.path.join(cfg.mano_assets_root, "models"),
-                model_type='mano', num_pca_comps=45,
-                batch_size=1, flat_hand_mean=True,
+        # Reuse the already-initialized MANOHelper instead of depending on a
+        # separate `mano.load(...)` API, which varies across environments.
+        mano_faces = getattr(self.mano, "faces", None)
+        if mano_faces is None:
+            raise AttributeError(
+                "MANOHelper does not expose `faces`; cannot build GrabNet losses."
             )
-            rh_f = torch.from_numpy(rhm.faces.astype(np.int32)).view(1, -1, 3)
+        rh_f = torch.from_numpy(np.asarray(mano_faces, dtype=np.int32)).view(1, -1, 3)
         self.rh_faces = rh_f.repeat(cfg.batch_size, 1, 1).to(self.device).long()
 
         # Vertex weights (try to load, fallback to ones)
-        c_weights_path = os.path.join("grabnet", "configs", "c_weights.npy")
+        c_weights_path = os.path.join("configs", "c_weights.npy")
         if os.path.exists(c_weights_path):
             v_weights = torch.from_numpy(np.load(c_weights_path)).float().to(self.device)
             self.v_weights = v_weights
@@ -515,7 +602,7 @@ class Trainer:
             self.logger.warning("c_weights.npy not found, using uniform vertex weights")
 
         # Edge pairs
-        vpe_path = os.path.join("grabnet", "configs", "vpe.npy")
+        vpe_path = os.path.join("configs", "vpe.npy")
         if os.path.exists(vpe_path):
             self.vpe = torch.from_numpy(np.load(vpe_path)).to(self.device).long()
         else:
@@ -524,9 +611,10 @@ class Trainer:
 
         # BPS basis for slot label propagation
         if os.path.exists(cfg.bps_path):
-            self.bps_basis = torch.from_numpy(
-                np.load(cfg.bps_path)['basis']
-            ).float().to(self.device)
+            bps_basis = np.load(cfg.bps_path)['basis']
+            if bps_basis.ndim == 3:
+                bps_basis = bps_basis.squeeze(0)
+            self.bps_basis = torch.from_numpy(bps_basis).float().to(self.device)
         else:
             self.bps_basis = None
             self.logger.warning(f"BPS basis not found at {cfg.bps_path}")
@@ -548,15 +636,22 @@ class Trainer:
         self.logger.info("=" * 60)
         self.logger.info("PoseGrabModel — GrabNet-style CVAE + RefineNet (Joint Training)")
         self.logger.info(f"  CoarseNet:     {n_model:,} params ({n_model/1e6:.2f}M)")
-        if self.refine_net is not None:
-            n_refine = sum(p.numel() for p in self.refine_net.parameters() if p.requires_grad)
+        if cfg.fit_refine:
+            n_refine = sum(p.numel() for p in self.model.refine_net.parameters() if p.requires_grad)
             self.logger.info(f"  RefineNet:     {n_refine:,} params ({n_refine/1e6:.2f}M)")
         self.logger.info(f"  Output:        rot6d={ROT6D_POSE_DIM} + trans={TRANS_DIM} (no shape)")
         self.logger.info(f"  Vocab size:    {cfg.vocab_size}")
         self.logger.info(f"  KL coef:       {cfg.kl_coef}")
         self.logger.info(f"  Grounder w:    {cfg.slot_grounder_weight}")
         self.logger.info(f"  Part-Contact w: {cfg.w_part_contact}")
+        if cfg.no_token_cond:
+            self.logger.info("  *** ABLATION: token conditioning DISABLED ***")
+        self.logger.info(f"  LR schedule:   warmup_steps={cfg.warmup_steps} + cosine decay")
         self.logger.info(f"  Token aug:     drop_p={cfg.token_drop_prob}  sub_p={cfg.token_sub_prob}")
+        self.logger.info(
+            f"  Best ckpt:     geom(contact>={cfg.best_geom_contact_min:.2f}, "
+            f"pen<={cfg.best_geom_pen_mm_max:.2f}mm) then max token_f1"
+        )
         self.logger.info(f"  Train:         {len(self.train_ds)} samples, "
                          f"{len(self.train_dl)} steps/epoch")
         self.logger.info("=" * 60)
@@ -573,7 +668,7 @@ class Trainer:
         t_mask     = batch["token_mask"].to(self.device)
         gt_trans   = batch["hand_tsl"].to(self.device)
         gt_orient_rotmat = batch["global_orient_rhand_rotmat"].to(self.device)
-        gt_verts   = batch["hand_verts"].to(self.device)
+        gt_pose    = batch["hand_pose"].to(self.device)
         obj_pc     = batch["obj_pc"].to(self.device)
         obj_vn     = batch["obj_vn"].to(self.device)
         bps_slot_labels = batch["bps_slot_labels"].to(self.device)
@@ -590,39 +685,46 @@ class Trainer:
 
         self.optimizer.zero_grad()
 
-        # ---- Slot-modulated BPS feature ----
-        slot_bps_feat = self.model.encode_slot_bps(
-            bps_object, bps_slot_labels, tokens, t_mask)
+        # ---- Token summary (semantic conditioning) ----
+        tok_summary = self.model.token_encoder(tokens, t_mask)   # (B, token_embed_dim)
+        if cfg.no_token_cond:
+            tok_summary = torch.zeros_like(tok_summary)
 
         # ---- SlotGrounder auxiliary loss ----
-        tok_summary = self.model.slot_bps._encode_token_summary(tokens, t_mask)
         grounder_logits = self.model.slot_grounder(bps_object, tok_summary)
         loss_grounder = self.model.slot_grounder.compute_loss(
             grounder_logits, bps_slot_labels)
 
         # ---- CoarseNet forward ----
         drec = self.model.forward_coarse(
-            bps_object, slot_bps_feat, gt_trans, gt_orient_rotmat,
+            bps_object, tok_summary, gt_trans, gt_orient_rotmat,
         )
 
-        # ---- MANO forward for predicted verts ----
+        # ---- MANO forward: both pred and GT use mean shape (zeros) ----
+        B = gt_trans.shape[0]
+        zeros_shape = torch.zeros(B, cfg.n_betas, device=self.device)
+
         with torch.cuda.amp.autocast(enabled=False):
             drec_float32 = {k: v.float() if isinstance(v, torch.Tensor) else v
                            for k, v in drec.items()}
             verts_pred, _ = self.mano(
                 drec_float32["fullpose_aa"],
                 drec_float32["transl"],
-                torch.zeros(gt_trans.shape[0], cfg.n_betas, device=self.device),
+                zeros_shape,
             )
 
+        # Recompute GT verts with mean shape to match inference
+        with torch.no_grad():
+            gt_verts, _ = self.mano(gt_pose, gt_trans, zeros_shape)
+
         # ---- CoarseNet Loss ----
-        B = gt_trans.shape[0]
         dorig = {"vpe": self.vpe} if self.vpe is not None else {}
         rh_faces = self.rh_faces[:B]
 
         loss_total, loss_dict = self.model.compute_coarse_loss(
             drec, dorig, verts_pred, gt_verts, obj_pc,
             rh_faces, self.v_weights, self.v_weights2, B,
+            obj_normals=obj_vn,
         )
 
         # ---- SlotGrounder loss ----
@@ -658,7 +760,8 @@ class Trainer:
         if cfg.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
         self.optimizer.step()
-        self.scheduler.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         return metrics
 
@@ -667,80 +770,79 @@ class Trainer:
     # ================================================================
 
     def _train_step_refine(self, batch) -> Dict[str, float]:
-        """RefineNet training step following GrabNet's joint training approach.
+        """RefineNet training step — GrabNet-style.
 
-        1. Generate coarse prediction from frozen/detached CoarseNet output
-        2. Compute h2o distances
-        3. RefineNet forward (iterative refinement)
-        4. Compute refine loss and backprop (only RefineNet params)
+        GrabNet feeds CoarseNet's actual reconstruction output to RefineNet.
+        CoarseNet encode→decode acts as a natural perturbation of the GT,
+        so RefineNet learns to correct realistic CoarseNet errors.
+
+        The CoarseNet forward is run with torch.no_grad() — RefineNet
+        gradients do not flow back into CoarseNet (separate optimizer).
         """
         cfg = self.cfg
-        if self.refine_net is None:
+        if not cfg.fit_refine:
             return {}
 
-        obj_pc   = batch["obj_pc"].to(self.device)
-        obj_vn   = batch["obj_vn"].to(self.device)
-        gt_verts = batch["hand_verts"].to(self.device)
-        gt_shape = batch["hand_shape"].to(self.device)
-        tokens   = batch["token_seq"].to(self.device)
-        t_mask   = batch["token_mask"].to(self.device)
+        obj_pc     = batch["obj_pc"].to(self.device)
+        obj_vn     = batch["obj_vn"].to(self.device)
+        gt_pose    = batch["hand_pose"].to(self.device)
+        gt_trans   = batch["hand_tsl"].to(self.device)
         bps_object = batch["bps_object"].to(self.device)
-        bps_slot_labels = batch["bps_slot_labels"].to(self.device)
+        tokens     = batch["token_seq"].to(self.device)
+        t_mask     = batch["token_mask"].to(self.device)
 
-        # Generate coarse prediction (detached from CoarseNet graph)
+        B = gt_pose.shape[0]
+        zeros_shape = torch.zeros(B, cfg.n_betas, device=self.device)
+
+        # ---- Compute GT verts & h2o distances with mean shape ----
         with torch.no_grad():
-            pred = self.model.sample(bps_object, tokens, t_mask,
-                                     bps_slot_labels=bps_slot_labels)
-            coarse_rot6d = aa_to_rot6d(pred.pose)
-            coarse_trans = pred.trans
-            coarse_shape = pred.shape
+            gt_verts, _ = self.mano(gt_pose, gt_trans, zeros_shape)
+            h2o_gt = RefineNet._compute_h2o_dist(gt_verts, obj_pc, obj_vn)
 
-            # Noise augmentation
-            if cfg.pose_noise_std > 0:
-                coarse_rot6d = coarse_rot6d + torch.randn_like(coarse_rot6d) * cfg.pose_noise_std
-            if cfg.trans_noise_std > 0:
-                coarse_trans = coarse_trans + torch.randn_like(coarse_trans) * cfg.trans_noise_std
+        # ---- Get CoarseNet reconstruction output (detached) ----
+        with torch.no_grad():
+            gt_orient_rotmat = batch["global_orient_rhand_rotmat"].to(self.device)
+            tok_summary = self.model.token_encoder(tokens, t_mask)
+            if self.model.no_token_cond:
+                tok_summary = torch.zeros_like(tok_summary)
 
-            # Compute coarse vertices and h2o distance
-            coarse_pose_aa = rot6d_to_aa(coarse_rot6d)
-            coarse_verts, _ = self.mano(coarse_pose_aa, coarse_trans, coarse_shape)
-            coarse_hand_normals = _compute_vertex_normals(
-                coarse_verts, self.mano.faces_tensor)
+            drec = self.model.coarse_net(
+                bps_object, gt_trans, gt_orient_rotmat, tok_summary,
+            )
+            coarse_rot6d = drec["pose_rot6d"]      # (B, 96)
+            coarse_trans = drec["transl"]            # (B, 3)
+            coarse_verts, _ = self.mano(drec["fullpose_aa"], coarse_trans, zeros_shape)
+            h2o_dist = RefineNet._compute_h2o_dist(coarse_verts, obj_pc, obj_vn)
 
-        h2o_dist = RefineNet._compute_h2o_dist(
-            coarse_verts, obj_pc, obj_vn, hand_normals=coarse_hand_normals)
-
-        # RefineNet forward
+        # ---- RefineNet forward ----
         self.optimizer_refine.zero_grad()
-        result = self.refine_net(
+        result = self.model.refine_net(
             h2o_dist, coarse_rot6d, coarse_trans,
-            obj_pc, self.mano, shape=coarse_shape, obj_normals=obj_vn,
+            obj_pc, self.mano, shape=zeros_shape, obj_normals=obj_vn,
         )
 
         # Compute refined vertices
-        refined_verts, _ = self.mano(result["pose"], result["trans"], coarse_shape)
+        refined_verts, _ = self.mano(result["pose"], result["trans"], zeros_shape)
 
-        # Loss
+        # ---- GrabNet-style RefineNet loss ----
         loss, metrics = compute_refine_loss(
             pred_verts=refined_verts,
             gt_verts=gt_verts,
             obj_pc=obj_pc,
-            mano_fn=self.mano,
+            v_weights=self.v_weights,
+            v_weights2=self.v_weights2,
+            vpe=self.vpe,
+            kl_coef=cfg.kl_coef,
+            h2o_gt=h2o_gt,
             obj_normals=obj_vn,
-            coarse_verts=coarse_verts,
-            w_vert=cfg.w_refine_vert,
-            w_dist=cfg.w_refine_dist,
-            w_pen=cfg.w_refine_pen,
-            w_contact=cfg.w_refine_contact,
-            w_reg=cfg.w_refine_reg,
-            contact_thresh=cfg.contact_thresh,
         )
 
         loss.backward()
         if cfg.max_grad_norm > 0:
-            nn.utils.clip_grad_norm_(self.refine_net.parameters(), cfg.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.model.refine_net.parameters(), cfg.max_grad_norm)
         self.optimizer_refine.step()
-        self.scheduler_refine.step()
+        if self.scheduler_refine is not None:
+            self.scheduler_refine.step()
 
         return {f"rnet_{k}": v for k, v in metrics.items()}
 
@@ -767,33 +869,45 @@ class Trainer:
     def _validate(self) -> Dict[str, float]:
         if self.val_dl is None:
             return {}
+        cfg = self.cfg
         self.model.eval()
-        if self.refine_net is not None:
-            self.refine_net.eval()
+        if cfg.fit_refine:
+            self.model.refine_net.eval()
         totals = defaultdict(float)
         n = 0
-        cfg = self.cfg
+        token_metric_samples = 0
 
         for batch in self.val_dl:
             bps_object = batch["bps_object"].to(self.device)
             tokens = batch["token_seq"].to(self.device)
             t_mask = batch["token_mask"].to(self.device)
             gt_trans = batch["hand_tsl"].to(self.device)
+            gt_pose = batch["hand_pose"].to(self.device)
             gt_orient_rotmat = batch["global_orient_rhand_rotmat"].to(self.device)
-            gt_verts = batch["hand_verts"].to(self.device)
             obj_pc = batch["obj_pc"].to(self.device)
             obj_vn = batch["obj_vn"].to(self.device)
+            obj_scale = batch["obj_scale"].to(self.device)
             B = gt_trans.shape[0]
+            zeros_shape = torch.zeros(B, cfg.n_betas, device=self.device)
+
+            # Recompute GT verts with mean shape
+            gt_verts, _ = self.mano(gt_pose, gt_trans, zeros_shape)
 
             bps_slot_labels = batch["bps_slot_labels"].to(self.device)
-            slot_bps_feat = self.model.encode_slot_bps(
-                bps_object, bps_slot_labels, tokens, t_mask)
+            obj_slot_labels = None
+            if self.bps_basis is not None:
+                obj_slot_labels = propagate_slot_labels(
+                    obj_pc, obj_scale, self.bps_basis, bps_slot_labels,
+                )
+            tok_summary = self.model.token_encoder(tokens, t_mask)
+            if cfg.no_token_cond:
+                tok_summary = torch.zeros_like(tok_summary)
             drec = self.model.forward_coarse(
-                bps_object, slot_bps_feat, gt_trans, gt_orient_rotmat,
+                bps_object, tok_summary, gt_trans, gt_orient_rotmat,
             )
 
             # SlotGrounder accuracy
-            pred_labels = self.model.predict_slot_labels(bps_object, tokens, t_mask)
+            pred_labels = self.model.slot_grounder.predict(bps_object, tok_summary)
             valid_mask = bps_slot_labels >= 0
             if valid_mask.any():
                 correct = (pred_labels[valid_mask] == bps_slot_labels[valid_mask]).float()
@@ -802,7 +916,7 @@ class Trainer:
             verts_pred, _ = self.mano(
                 drec["fullpose_aa"].float(),
                 drec["transl"].float(),
-                torch.zeros(B, cfg.n_betas, device=self.device),
+                zeros_shape,
             )
 
             dorig = {"vpe": self.vpe} if self.vpe is not None else {}
@@ -810,11 +924,11 @@ class Trainer:
             loss_total, loss_dict = self.model.compute_coarse_loss(
                 drec, dorig, verts_pred, gt_verts, obj_pc,
                 rh_faces, self.v_weights, self.v_weights2, B,
+                obj_normals=obj_vn,
             )
 
             # Sample-based metrics
-            pred = self.model.sample(bps_object, tokens, t_mask,
-                                     bps_slot_labels=bps_slot_labels)
+            pred = self.model.sample(bps_object, tokens, t_mask)
 
             pred_verts, _ = self.mano(
                 pred.pose, pred.trans,
@@ -828,38 +942,103 @@ class Trainer:
             contact_mask = h2o_signed.abs() < cfg.contact_thresh
             sample_has_contact = contact_mask.any(dim=1).float()
 
+            final_verts = pred_verts
+            final_pen_mm = pen_depth.mean().item() * 1000.0
+            final_contact = sample_has_contact.mean().item()
+
             # RefineNet validation
-            if self.refine_net is not None:
+            if cfg.fit_refine:
                 coarse_rot6d = aa_to_rot6d(pred.pose)
                 coarse_verts = pred_verts
-                coarse_hand_normals = _compute_vertex_normals(
-                    coarse_verts, self.mano.faces_tensor)
-                h2o_dist = RefineNet._compute_h2o_dist(
-                    coarse_verts, obj_pc, obj_vn, hand_normals=coarse_hand_normals)
-                rnet_result = self.refine_net(
+                h2o_dist = RefineNet._compute_h2o_dist(coarse_verts, obj_pc, obj_vn)
+                rnet_result = self.model.refine_net(
                     h2o_dist, coarse_rot6d, pred.trans,
                     obj_pc, self.mano, shape=pred.shape, obj_normals=obj_vn)
                 refined_verts, _ = self.mano(rnet_result["pose"], rnet_result["trans"], pred.shape)
 
-                refined_h2o = RefineNet._compute_h2o_dist(
-                    refined_verts, obj_pc, obj_vn,
-                    hand_normals=_compute_vertex_normals(refined_verts, self.mano.faces_tensor))
-                pen_refined = torch.relu(-refined_h2o).mean().item() * 1000.0
-                contact_refined = (refined_h2o.abs() < cfg.contact_thresh).any(dim=1).float().mean().item()
+                # RefineNet loss (for scheduler and monitoring)
+                rnet_loss, rnet_metrics = compute_refine_loss(
+                    pred_verts=refined_verts,
+                    gt_verts=gt_verts,
+                    obj_pc=obj_pc,
+                    v_weights=self.v_weights,
+                    v_weights2=self.v_weights2,
+                    vpe=self.vpe,
+                    kl_coef=cfg.kl_coef,
+                    obj_normals=obj_vn,
+                )
+                for rk, rv in rnet_metrics.items():
+                    totals[f"rnet_{rk}"] += rv * B
+
+                # Use signed distance for penetration monitoring
+                _, refined_h2o_signed, _ = point2point_signed(
+                    refined_verts, obj_pc, y_normals=obj_vn)
+                pen_refined = torch.relu(-refined_h2o_signed).mean().item() * 1000.0
+                contact_refined = (refined_h2o_signed.abs() < cfg.contact_thresh).any(dim=1).float().mean().item()
                 totals["pen_refined_mm"] += pen_refined * B
                 totals["contact_refined"] += contact_refined * B
+                final_verts = refined_verts
+                final_pen_mm = pen_refined
+                final_contact = contact_refined
+
+            if obj_slot_labels is not None:
+                token_eval_mask = (obj_slot_labels >= 0).any(dim=1)
+            else:
+                token_eval_mask = None
+
+            if token_eval_mask is not None and token_eval_mask.any():
+                eval_B = int(token_eval_mask.sum().item())
+
+                def _tok_f1(verts_eval):
+                    cm = recover_contact_matrix_from_obj_slots(
+                        verts_eval[token_eval_mask],
+                        obj_pc[token_eval_mask],
+                        obj_slot_labels[token_eval_mask],
+                        self.vert_to_part,
+                        contact_distance=cfg.contact_thresh,
+                        num_slots=NUM_SLOTS,
+                    )
+                    return compute_token_recall_f1(
+                        cm, tokens[token_eval_mask], t_mask[token_eval_mask]
+                    )
+
+                # Coarse token_f1 (before RefineNet) — used for best.pt selection
+                coarse_recall, coarse_f1 = _tok_f1(pred_verts)
+                totals["token_recall"] += coarse_recall.mean().item() * eval_B
+                totals["token_f1"] += coarse_f1.mean().item() * eval_B
+
+                # Refined token_f1 (after RefineNet) — diagnostic only
+                if cfg.fit_refine:
+                    refined_recall, refined_f1 = _tok_f1(final_verts)
+                    totals["token_f1_refined"] += refined_f1.mean().item() * eval_B
+                    totals["token_recall_refined"] += refined_recall.mean().item() * eval_B
+
+                token_metric_samples += eval_B
+            else:
+                totals["token_recall"] += 0.0
+                totals["token_f1"] += 0.0
 
             for k, v in loss_dict.items():
                 val = v.item() if isinstance(v, torch.Tensor) else v
                 totals[k] += val * B
             totals["pen_depth_mm"] += pen_depth.mean().item() * 1000.0 * B
             totals["contact_rate"] += sample_has_contact.mean().item() * B
+            totals["final_pen_mm"] += final_pen_mm * B
+            totals["final_contact_rate"] += final_contact * B
             n += B
 
         self.model.train()
-        if self.refine_net is not None:
-            self.refine_net.train()
-        return {f"val/{k}": v / max(n, 1) for k, v in totals.items()}
+        if cfg.fit_refine:
+            self.model.refine_net.train()
+        _token_keys = {"token_recall", "token_f1", "token_f1_refined", "token_recall_refined"}
+        metrics = {}
+        for k, v in totals.items():
+            if k in _token_keys:
+                metrics[f"val/{k}"] = v / max(token_metric_samples, 1)
+            else:
+                metrics[f"val/{k}"] = v / max(n, 1)
+        metrics["val/token_eval_samples"] = float(token_metric_samples)
+        return metrics
 
     # ================================================================
     # Save / Load
@@ -870,17 +1049,18 @@ class Trainer:
         save_dict = {
             "model":       self.model.state_dict(),
             "optimizer":   self.optimizer.state_dict(),
-            "scheduler":   self.scheduler.state_dict(),
+            "scheduler":   self.scheduler.state_dict() if self.scheduler else {},
             "epoch":       self.epoch,
             "global_step": self.global_step,
             "best_val":    self.best_val,
+            "best_token_f1": self.best_token_f1,
             "no_improve_evals": self.no_improve_evals,
             "config":      self.cfg.__dict__,
         }
-        if self.refine_net is not None:
-            save_dict["refine_net"] = self.refine_net.state_dict()
+        if self.optimizer_refine is not None:
             save_dict["optimizer_refine"] = self.optimizer_refine.state_dict()
-            save_dict["scheduler_refine"] = self.scheduler_refine.state_dict()
+            if self.scheduler_refine:
+                save_dict["scheduler_refine"] = self.scheduler_refine.state_dict()
         torch.save(save_dict, path)
         self.logger.info(f"  Saved: {path}")
 
@@ -894,20 +1074,25 @@ class Trainer:
                 self.logger.warning(f"    missing: {k}")
             for k in unexpected[:5]:
                 self.logger.warning(f"    unexpected: {k}")
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scheduler.load_state_dict(ckpt["scheduler"])
+        try:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        except (KeyError, ValueError) as e:
+            self.logger.warning(f"  Optimizer state_dict mismatch (type changed?), skipping: {e}")
+        if self.scheduler and "scheduler" in ckpt and ckpt["scheduler"]:
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler"])
+            except (KeyError, ValueError) as e:
+                self.logger.warning(f"  Scheduler state_dict mismatch, skipping: {e}")
 
-        # RefineNet
-        if self.refine_net is not None and "refine_net" in ckpt:
-            self.refine_net.load_state_dict(ckpt["refine_net"])
+        # RefineNet optimizer/scheduler (weights already loaded with model)
+        if self.optimizer_refine is not None:
             if "optimizer_refine" in ckpt:
                 self.optimizer_refine.load_state_dict(ckpt["optimizer_refine"])
-            if "scheduler_refine" in ckpt:
-                self.scheduler_refine.load_state_dict(ckpt["scheduler_refine"])
 
         self.epoch       = ckpt.get("epoch", 0)
         self.global_step = ckpt.get("global_step", 0)
         self.best_val    = ckpt.get("best_val", float("inf"))
+        self.best_token_f1 = ckpt.get("best_token_f1", float("-inf"))
         self.no_improve_evals = ckpt.get("no_improve_evals", 0)
         self.logger.info(f"  Resumed: epoch={self.epoch}, step={self.global_step}")
 
@@ -926,8 +1111,8 @@ class Trainer:
     def train(self):
         cfg = self.cfg
         self.model.train()
-        if self.refine_net is not None:
-            self.refine_net.train()
+        if cfg.fit_refine:
+            self.model.refine_net.train()
         self.logger.info(f"\nStart training: {cfg.epochs} epochs")
         should_stop = False
 
@@ -949,9 +1134,10 @@ class Trainer:
                     grnd = f"  grnd={log.get('loss_grounder', 0):.4f}"
                     pc_loss = f"  pc={log.get('loss_part_contact', 0):.4f}" if cfg.w_part_contact > 0 else ""
                     rnet = ""
-                    if self.refine_net is not None:
+                    if cfg.fit_refine:
                         rnet = (f"  | rnet_loss={log.get('rnet_refine_loss', 0):.4f}"
-                                f"  rnet_pen={log.get('rnet_refine_pen', 0):.4f}")
+                                f"  rnet_dist={log.get('rnet_refine_dist_h', 0):.4f}"
+                                f"  rnet_mesh={log.get('rnet_refine_mesh_rec', 0):.4f}")
                     self.logger.info(
                         f"  S{self.global_step:06d}  "
                         f"total={log.get('loss_total', 0):.4f}  "
@@ -967,52 +1153,106 @@ class Trainer:
                             if isinstance(v, (int, float)):
                                 self.tb.add_scalar(f"train/{k}", v, self.global_step)
 
-                if self.global_step % cfg.val_every == 0:
-                    val = self._validate()
-                    if val:
-                        vt = val.get("val/loss_total", float("inf"))
-                        val_msg = (
-                            f"  [VAL]    "
-                            f"total={vt:.4f}  "
-                            f"contact={val.get('val/contact_rate', 0):.3f}  "
-                            f"pen={val.get('val/pen_depth_mm', 0):.2f}mm")
-                        if self.refine_net is not None:
-                            val_msg += (
-                                f"  | refined: pen={val.get('val/pen_refined_mm', 0):.2f}mm"
-                                f"  contact={val.get('val/contact_refined', 0):.3f}")
-                        self.logger.info(val_msg)
-
-                        if self.tb:
-                            for k, v in val.items():
-                                self.tb.add_scalar(k, v, self.global_step)
-
-                        if vt < self.best_val:
-                            self.best_val = vt
-                            self.no_improve_evals = 0
-                            self._save_checkpoint("best")
-                            self.logger.info(f"  * New best: total={vt:.4f}")
-                        else:
-                            self.no_improve_evals += 1
-                            remaining = max(cfg.early_stop_patience - self.no_improve_evals, 0)
-                            self.logger.info(
-                                f"  [EARLY STOP] no improvement for {self.no_improve_evals}/"
-                                f"{cfg.early_stop_patience} (remaining={remaining})")
-                            if self.no_improve_evals >= cfg.early_stop_patience:
-                                self.logger.info("Early stopping triggered.")
-                                should_stop = True
-
                 if self.global_step % cfg.save_every == 0:
                     self._save_checkpoint("latest")
                     self._save_checkpoint(f"step_{self.global_step:07d}")
                     self._cleanup_checkpoints()
 
-                if should_stop:
-                    break
-
+            # --- End of epoch: validate + scheduler step (following GrabNet) ---
             dt = time.time() - t0
             self.logger.info(
                 f"  Epoch {ep} done  {dt:.0f}s  "
                 f"avg_loss={epoch_loss / max(n_steps, 1):.4f}")
+
+            val = self._validate()
+            if val:
+                vt = val.get("val/loss_total", float("inf"))
+                val_token_f1 = val.get("val/token_f1", 0.0)
+                val_token_recall = val.get("val/token_recall", 0.0)
+                final_contact = val.get("val/final_contact_rate", val.get("val/contact_rate", 0.0))
+                final_pen_mm = val.get("val/final_pen_mm", val.get("val/pen_depth_mm", float("inf")))
+                val_msg = (
+                    f"  [VAL]    "
+                    f"total={vt:.4f}  "
+                    f"contact={val.get('val/contact_rate', 0):.3f}  "
+                    f"pen={val.get('val/pen_depth_mm', 0):.2f}mm  "
+                    f"coarse_f1={val_token_f1:.3f}  "
+                    f"coarse_recall={val_token_recall:.3f}")
+                if cfg.fit_refine:
+                    val_msg += (
+                        f"  | refined: loss={val.get('val/rnet_refine_loss', 0):.4f}"
+                        f"  pen={val.get('val/pen_refined_mm', 0):.2f}mm"
+                        f"  contact={val.get('val/contact_refined', 0):.3f}"
+                        f"  f1={val.get('val/token_f1_refined', 0):.3f}")
+                val_msg += (
+                    f"  | best-gate: final_contact={final_contact:.3f}"
+                    f"  final_pen={final_pen_mm:.2f}mm"
+                )
+                self.logger.info(val_msg)
+
+                if self.tb:
+                    for k, v in val.items():
+                        self.tb.add_scalar(k, v, self.global_step)
+
+                cur_lr = self.optimizer.param_groups[0]['lr']
+                refine_lr_msg = ""
+                if self.optimizer_refine is not None:
+                    refine_lr = self.optimizer_refine.param_groups[0]['lr']
+                    refine_lr_msg = f"  refine_lr={refine_lr:.2e}"
+                self.logger.info(f"  lr={cur_lr:.2e}{refine_lr_msg}")
+
+                geom_ok = (
+                    final_contact >= cfg.best_geom_contact_min
+                    and final_pen_mm <= cfg.best_geom_pen_mm_max
+                )
+                if geom_ok:
+                    if val_token_f1 > self.best_token_f1:
+                        prev_best = self.best_token_f1
+                        self.best_token_f1 = val_token_f1
+                        self._save_checkpoint("best")
+                        if prev_best == float("-inf"):
+                            self.logger.info(
+                                f"  * New best: token_f1={val_token_f1:.4f} "
+                                f"(geometry gate passed)"
+                            )
+                        else:
+                            self.logger.info(
+                                f"  * New best: token_f1={val_token_f1:.4f} "
+                                f"(prev={prev_best:.4f}, geometry gate passed)"
+                            )
+                    else:
+                        self.logger.info(
+                            f"  Best gate passed, but token_f1={val_token_f1:.4f} "
+                            f"did not beat best={self.best_token_f1:.4f}"
+                        )
+                else:
+                    self.logger.info(
+                        f"  Best gate failed: need contact>={cfg.best_geom_contact_min:.2f} "
+                        f"and pen<={cfg.best_geom_pen_mm_max:.2f}mm"
+                    )
+
+                # Early stopping: track val loss improvement, but only trigger
+                # if best.pt has been saved at least once (geometry gate passed).
+                if vt < self.best_val:
+                    self.best_val = vt
+                    self.no_improve_evals = 0
+                    self.logger.info(f"  * New loss best: total={vt:.4f}")
+                else:
+                    self.no_improve_evals += 1
+                    remaining = max(cfg.early_stop_patience - self.no_improve_evals, 0)
+                    self.logger.info(
+                        f"  [EARLY STOP] no improvement for {self.no_improve_evals}/"
+                        f"{cfg.early_stop_patience} (remaining={remaining})")
+                    if self.no_improve_evals >= cfg.early_stop_patience:
+                        if self.best_token_f1 > float("-inf"):
+                            self.logger.info("Early stopping triggered (best.pt exists).")
+                            should_stop = True
+                        else:
+                            self.logger.info(
+                                "Early stop patience exhausted, but geometry gate "
+                                "never passed — continuing training."
+                            )
+
             if should_stop:
                 break
 
@@ -1029,13 +1269,13 @@ def parse_args():
 
     p.add_argument("--cache_dir",     type=str, default="cache/contact_tokens/train")
     p.add_argument("--val_cache_dir", type=str, default="cache/contact_tokens/val")
-    p.add_argument("--n_pc_points",   type=int, default=2048)
-    p.add_argument("--bps_path",      type=str, default="grabnet/configs/bps.npz")
+    p.add_argument("--n_pc_points",   type=int, default=10000)
+    p.add_argument("--bps_path",      type=str, default="configs/bps.npz")
 
     p.add_argument("--model_config",  type=str, default="base")
-    p.add_argument("--kl_coef",       type=float, default=0.005)
+    p.add_argument("--kl_coef",       type=float, default=0.01)
 
-    # Slot-grounded BPS
+    # Slot supervision / part-contact auxiliaries
     p.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                    help="Directory for per-object BPS slot cache")
     p.add_argument("--slot_grounder_weight", type=float, default=1.0,
@@ -1045,22 +1285,29 @@ def parse_args():
     p.add_argument("--fit_refine", action=argparse.BooleanOptionalAction, default=True,
                    help="Joint training of RefineNet (default: True)")
     p.add_argument("--refine_n_iters", type=int, default=3)
-    p.add_argument("--refine_lr", type=float, default=5e-5)
+    p.add_argument("--refine_lr", type=float, default=5e-4)
 
     # Part-Contact Loss
-    p.add_argument("--w_part_contact", type=float, default=1.0,
+    p.add_argument("--w_part_contact", type=float, default=10.0,
                    help="Weight for Part-Contact Consistency Loss")
 
-    p.add_argument("--epochs",       type=int,   default=200)
-    p.add_argument("--batch_size",   type=int,   default=64)
-    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--epochs",       type=int,   default=100)
+    p.add_argument("--batch_size",   type=int,   default=128)
+    p.add_argument("--lr",           type=float, default=5e-4)
+    p.add_argument("--warmup_steps", type=int,   default=1000)
     p.add_argument("--resume",       type=str,   default="")
     p.add_argument("--save_dir",     type=str,   default="checkpoints/decoder")
     p.add_argument("--log_dir",      type=str,   default="logs/decoder")
-    p.add_argument("--seed",         type=int,   default=7725)
-    p.add_argument("--token_drop_prob", type=float, default=0.2)
-    p.add_argument("--token_sub_prob",  type=float, default=0.05)
+    p.add_argument("--seed",         type=int,   default=42)
+    p.add_argument("--token_drop_prob", type=float, default=0.0)
+    p.add_argument("--token_sub_prob",  type=float, default=0.0)
     p.add_argument("--contact_thresh",  type=float, default=0.005)
+    p.add_argument("--best_geom_contact_min", type=float, default=0.90)
+    p.add_argument("--best_geom_pen_mm_max",  type=float, default=12.0)
+
+    # Ablation
+    p.add_argument("--no_token_cond", action="store_true",
+                   help="Zero out token conditioning (ablation test)")
 
     return p.parse_args()
 
@@ -1083,6 +1330,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        warmup_steps=args.warmup_steps,
         resume=args.resume,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
@@ -1090,6 +1338,9 @@ def main():
         token_drop_prob=args.token_drop_prob,
         token_sub_prob=args.token_sub_prob,
         contact_thresh=args.contact_thresh,
+        best_geom_contact_min=args.best_geom_contact_min,
+        best_geom_pen_mm_max=args.best_geom_pen_mm_max,
+        no_token_cond=args.no_token_cond,
     )
     Trainer(cfg).train()
 

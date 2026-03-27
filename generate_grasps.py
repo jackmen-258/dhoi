@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-generate_grasps.py (v16 — GrabNet-style CVAE Decoder)
+generate_grasps.py (v18 — GrabNet-style CVAE + RefineNet)
 从物体点云生成抓握姿态
 
 架构:
   Stage 1: diffusion_obj_enc + token denoiser → contact tokens
-  Stage 2: BPS + token_cond → CoarseNet CVAE → pose + trans (no shape)
+  Stage 2: BPS + token_cond → CoarseNet CVAE → coarse pose + trans
+           PoseGrabModel.refine_net → geometry-only iterative refinement (no shape)
 """
 
 import os
@@ -23,10 +24,11 @@ from tqdm import tqdm
 from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.token_denoiser import build_denoiser
-from models.pose_decoder import build_grab_model
+from models.pose_decoder import build_grab_model, RefineNet
 from models.discrete_diffusion import AbsorbingDiffusion
 from models.clip_encoder import CLIPTextEncoder
 from utils.mano_utils import MANOHelper
+from utils.pose_utils import aa_to_rot6d
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,8 +119,13 @@ def load_models(args, device):
         vocab_size=dec_cfg.get("vocab_size", vocab_size),
         n_betas=dec_cfg.get("n_betas", args.n_betas),
     ).to(device)
-    decoder.load_state_dict(dec_state["model"])
-    logger.info("  Decoder loaded (slot-grounded BPS)")
+    missing, unexpected = decoder.load_state_dict(dec_state["model"], strict=False)
+    if missing:
+        logger.warning(f"  Decoder load: {len(missing)} missing keys (first 5: {missing[:5]})")
+    if unexpected:
+        logger.warning(f"  Decoder load: {len(unexpected)} unexpected keys (first 5: {unexpected[:5]})")
+    has_refine = any(k.startswith("refine_net.") for k in dec_state["model"].keys())
+    logger.info(f"  Decoder loaded (BPS + scheme-B token conditioning, RefineNet={'✓' if has_refine else '✗'})")
 
     # BPS basis for object encoding
     bps_path = dec_cfg.get("bps_path", args.bps_path)
@@ -132,7 +139,7 @@ def load_models(args, device):
     diffusion_obj_enc.eval()
     denoiser.eval()
     decoder.eval()
-    for model in (diffusion_obj_enc, denoiser, decoder):
+    for model in [diffusion_obj_enc, denoiser, decoder]:
         for p in model.parameters():
             p.requires_grad = False
 
@@ -147,11 +154,11 @@ def load_models(args, device):
         "denoiser": denoiser,
         "diffusion": diffusion,
         "decoder": decoder,
+        "has_refine": has_refine,
         "bps_basis": bps_basis,
         "mano": mano,
         "clip_encoder": clip_encoder,
         "pad_token_id": pad_token_id,
-        "use_slot_bps": True,
     }
 
 
@@ -165,8 +172,21 @@ def _compute_bps(obj_pc, bps_basis):
         bps_object: (1, K) BPS distance encoding
     """
     from bps_torch.bps import bps_torch
-    bps = bps_torch(custom_basis=bps_basis.cpu(), device=obj_pc.device)
-    result = bps.encode(obj_pc.squeeze(0), feature_type='dists')
+
+    # Match training/cache preprocessing:
+    # bbox center + bbox diagonal normalization in BPS space.
+    xyz_min = obj_pc.amin(dim=1, keepdim=True)
+    xyz_max = obj_pc.amax(dim=1, keepdim=True)
+    center = (xyz_min + xyz_max) / 2.0
+    scale = (xyz_max - xyz_min).norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    obj_pc_norm = (obj_pc - center) / scale
+
+    basis = bps_basis
+    if basis.ndim == 3:
+        basis = basis.squeeze(0)
+
+    bps = bps_torch(custom_basis=basis.cpu(), device=obj_pc.device)
+    result = bps.encode(obj_pc_norm.squeeze(0), feature_type='dists')
     return result['dists'].reshape(1, -1)
 
 
@@ -179,7 +199,7 @@ def load_bps_slot_cache(args, split):
     slot_dir = os.path.join(args.bps_slot_cache_dir, split)
     if not os.path.isdir(slot_dir):
         logger.info(f"BPS slot cache not found at {slot_dir}; "
-                     f"will use SlotGrounder for inference")
+                     f"will compute BPS online for inference")
         return None
 
     # Just store the directory path; load individual files on demand
@@ -219,14 +239,14 @@ def get_bps_slot_data(bps_slot_cache, obj_id, device):
 
 @torch.no_grad()
 def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
-                    bps_dists_cached=None, bps_slot_labels_cached=None):
+                    bps_dists_cached=None):
     diffusion_obj_enc = models["diffusion_obj_enc"]
     denoiser = models["denoiser"]
     diffusion = models["diffusion"]
     decoder = models["decoder"]
+    has_refine = models["has_refine"]
     bps_basis = models["bps_basis"]
     mano = models["mano"]
-    # slot BPS is always enabled
 
     diff_obj_pc_norm, _ = normalize_object_points(obj_pc)
     diff_obj_input = torch.cat([diff_obj_pc_norm, obj_vn], dim=-1)
@@ -251,36 +271,48 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
     tokens = result["samples"]
     inferred_mask = tokens != models["pad_token_id"]
 
-    # ---- Stage 2: CVAE decoder → coarse pose ----
+    # ---- Stage 2: CVAE decoder → coarse pose → RefineNet ----
     if bps_dists_cached is not None:
         # Use cached BPS dists from slot cache (normalized per-object)
         bps_object = bps_dists_cached
     else:
         bps_object = _compute_bps(obj_pc, bps_basis)
 
-    # Pass slot labels if available; otherwise SlotGrounder will predict them
     pred = decoder.sample(
         bps_object, tokens, inferred_mask,
-        bps_slot_labels=bps_slot_labels_cached,
     )
 
-    n_betas = pred.shape.shape[-1] if pred.shape is not None else args.n_betas
-    verts, joints = mano(pred.pose, pred.trans, pred.shape)
+    final_pose = pred.pose
+    final_trans = pred.trans
+    final_shape = pred.shape
+
+    if has_refine:
+        coarse_rot6d = aa_to_rot6d(pred.pose)
+        coarse_verts, _ = mano(pred.pose, pred.trans, pred.shape)
+        h2o_dist = RefineNet._compute_h2o_dist(coarse_verts, obj_pc, obj_vn)
+        refined = decoder.refine_net(
+            h2o_dist, coarse_rot6d, pred.trans,
+            obj_pc, mano, shape=pred.shape, obj_normals=obj_vn,
+        )
+        final_pose = refined["pose"]
+        final_trans = refined["trans"]
+
+    verts, joints = mano(final_pose, final_trans, final_shape)
 
     return (
         verts[0].cpu().numpy(),
         joints[0].cpu().numpy(),
         {
-            "pose": pred.pose[0].cpu().numpy(),
-            "trans": pred.trans[0].cpu().numpy(),
-            "shape": pred.shape[0].cpu().numpy(),
+            "pose": final_pose[0].cpu().numpy(),
+            "trans": final_trans[0].cpu().numpy(),
+            "shape": final_shape[0].cpu().numpy(),
         },
         tokens[0].cpu().numpy(),
     )
 
 
 def main():
-    parser = argparse.ArgumentParser("Generate grasps (v16, diffusion + CVAE decoder)")
+    parser = argparse.ArgumentParser("Generate grasps (v18, diffusion + CVAE decoder + RefineNet)")
 
     parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/diffusion/best.pt")
     parser.add_argument("--decoder_ckpt", type=str, default="checkpoints/decoder/best.pt")
@@ -290,14 +322,14 @@ def main():
     parser.add_argument("--oi_intent", type=str, default="all")
     parser.add_argument("--category", dest="oi_category", type=str)
     parser.add_argument("--intent", dest="oi_intent", type=str)
-    parser.add_argument("--n_pc_points", type=int, default=2048)
+    parser.add_argument("--n_pc_points", type=int, default=10000)
 
     parser.add_argument("--decoder_config", type=str, default="base")
     parser.add_argument("--denoiser_config", type=str, default="base")
     parser.add_argument("--obj_global_dim", type=int, default=256)
     parser.add_argument("--obj_point_dim", type=int, default=256)
     parser.add_argument("--n_betas", type=int, default=10)
-    parser.add_argument("--bps_path", type=str, default="grabnet/configs/bps.npz")
+    parser.add_argument("--bps_path", type=str, default="configs/bps.npz")
     parser.add_argument("--text_feat_dim", type=int, default=512)
     parser.add_argument("--use_text", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vocab_size", type=int, default=26)
@@ -381,11 +413,12 @@ def main():
     logger.info(f"  Split:           {args.split}")
     logger.info(f"  Source samples:  {n_items}")
     logger.info(f"  Generate count:  {n_generate}")
-    logger.info(f"  Decoder:         GrabNet-style CVAE (Slot BPS)")
+    decoder_desc = "GrabNet-style CVAE + RefineNet" if models["has_refine"] else "GrabNet-style CVAE (coarse only)"
+    logger.info(f"  Decoder:         {decoder_desc}")
     logger.info(f"  Temperature:     {args.temperature}")
     logger.info(f"  Guidance scale:  {args.guidance_scale}")
     logger.info(f"  Text condition:  {text_mode}")
-    logger.info(f"  BPS slot cache:  {'loaded' if bps_slot_cache else 'none (SlotGrounder)'}")
+    logger.info(f"  BPS slot cache:  {'loaded (cached BPS dists available)' if bps_slot_cache else 'none (compute BPS online)'}")
     logger.info(f"  Output:          {results_dir}")
     logger.info("=" * 60)
 
@@ -409,7 +442,7 @@ def main():
         obj_id = oi_sample.get("obj_id", f"obj_{si:05d}")
 
         # BPS slot cache lookup by obj_id
-        bps_dists_cached, bps_slot_labels_cached = get_bps_slot_data(
+        bps_dists_cached, _ = get_bps_slot_data(
             bps_slot_cache, obj_id, device)
 
         if text_mode == "cache":
@@ -422,7 +455,6 @@ def main():
         hand_verts, hand_joints, mano_params, tokens = generate_single(
             models, obj_pc, obj_vn, args, text_feat=text_feat,
             bps_dists_cached=bps_dists_cached,
-            bps_slot_labels_cached=bps_slot_labels_cached,
         )
 
         grasp_result = {
@@ -472,7 +504,7 @@ def main():
 
     meta = {
         "args": vars(args),
-        "decoder_type": "cvae",
+        "decoder_type": "cvae+refine" if models["has_refine"] else "cvae",
         "total_generated": total_generated,
         "elapsed_seconds": elapsed,
         "num_source_samples": n_items,

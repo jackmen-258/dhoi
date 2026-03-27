@@ -65,7 +65,14 @@ def _rotmat_to_aa_stable(R: torch.Tensor) -> torch.Tensor:
 
 
 def _rotmat_to_rot6d(R):
-    return R[..., :2].reshape(*R.shape[:-2], 6)
+    """Extract first two columns of rotation matrix as 6D representation.
+
+    R[..., :2] gives (..., 3, 2), but .reshape(6) would interleave rows.
+    We need column-major order: [col0(3), col1(3)] to match _rot6d_to_rotmat
+    which splits as a1=[:3], a2=[3:6].
+    """
+    # R[..., 0] = first column (3,), R[..., 1] = second column (3,)
+    return torch.cat([R[..., 0], R[..., 1]], dim=-1)
 
 def _rot6d_to_rotmat(r6d):
     a1, a2 = r6d[..., :3], r6d[..., 3:6]

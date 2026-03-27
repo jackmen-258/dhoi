@@ -480,7 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--proc_dir", type=str,
                         default="cache/OakInkShape_object_process",
                         help="Preprocessed objects dir (watertight/ voxel/ vhacd/)")
-    parser.add_argument("--n_jobs",   type=int, default=8)
+    parser.add_argument("--n_jobs",   type=int, default=4)
     parser.add_argument("--contact_thresh", type=float, default=0.005,
                         help="Near-surface contact threshold in meters (default: 0.005 = 5mm)")
     parser.add_argument("-g", "--gpu_id", type=str, default="0")

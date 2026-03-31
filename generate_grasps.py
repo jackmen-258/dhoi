@@ -24,7 +24,9 @@ from tqdm import tqdm
 from models.object_normalization import normalize_object_points
 from models.point_encoder import PointNet2Encoder
 from models.token_denoiser import build_denoiser
-from models.pose_decoder import build_grab_model, RefineNet
+from models.pose_decoder import (
+    build_grab_model, RefineNet, sanitize_posegrab_state_dict_for_load,
+)
 from models.discrete_diffusion import AbsorbingDiffusion
 from models.clip_encoder import CLIPTextEncoder
 from utils.mano_utils import MANOHelper
@@ -61,6 +63,49 @@ def build_generation_indices(oi):
     n_items = len(oi)
 
     return list(range(n_items))
+
+
+def _matches_prefix(key, prefixes):
+    return any(key == prefix or key.startswith(f"{prefix}.") for prefix in prefixes)
+
+
+def _load_decoder_stage(
+    decoder,
+    ckpt_path,
+    device,
+    only_prefixes,
+    stage_name,
+):
+    logger.info(f"Loading decoder {stage_name}: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device)
+    raw_model_state = state["model"]
+    filtered_state = {
+        k: v for k, v in raw_model_state.items()
+        if _matches_prefix(k, only_prefixes)
+    }
+    model_state, dropped = sanitize_posegrab_state_dict_for_load(
+        filtered_state, decoder.state_dict()
+    )
+    if any(k.startswith("slot_grounder.") for k in raw_model_state):
+        logger.info("  Remapped legacy decoder keys: slot_grounder.* -> bps_slot_predictor.*")
+    if dropped:
+        logger.warning(f"  Dropped {len(dropped)} incompatible decoder tensors from {stage_name}")
+        for key, src_shape, dst_shape in dropped[:5]:
+            logger.warning(f"    shape mismatch: {key} ckpt={src_shape} model={dst_shape}")
+    missing, unexpected = decoder.load_state_dict(model_state, strict=False)
+    relevant_missing = [k for k in missing if _matches_prefix(k, only_prefixes)]
+    relevant_unexpected = [k for k in unexpected if _matches_prefix(k, only_prefixes)]
+    if relevant_missing:
+        logger.warning(
+            f"  Decoder {stage_name} load: {len(relevant_missing)} missing keys "
+            f"(first 5: {relevant_missing[:5]})"
+        )
+    if relevant_unexpected:
+        logger.warning(
+            f"  Decoder {stage_name} load: {len(relevant_unexpected)} unexpected keys "
+            f"(first 5: {relevant_unexpected[:5]})"
+        )
+    return state
 
 
 
@@ -110,22 +155,36 @@ def load_models(args, device):
         num_timesteps=num_timesteps,
     ).to(device)
 
-    logger.info(f"Loading decoder: {args.decoder_ckpt}")
-    dec_state = torch.load(args.decoder_ckpt, map_location=device)
-    dec_cfg = dec_state.get("config", {})
+    cnet_state = torch.load(args.decoder_cnet_ckpt, map_location=device)
+    rnet_state = torch.load(args.decoder_rnet_ckpt, map_location=device)
+    dec_cfg = cnet_state.get("config", {}) or rnet_state.get("config", {})
 
     decoder = build_grab_model(
         dec_cfg.get("model_config", args.decoder_config),
         vocab_size=dec_cfg.get("vocab_size", vocab_size),
         n_betas=dec_cfg.get("n_betas", args.n_betas),
     ).to(device)
-    missing, unexpected = decoder.load_state_dict(dec_state["model"], strict=False)
-    if missing:
-        logger.warning(f"  Decoder load: {len(missing)} missing keys (first 5: {missing[:5]})")
-    if unexpected:
-        logger.warning(f"  Decoder load: {len(unexpected)} unexpected keys (first 5: {unexpected[:5]})")
-    has_refine = any(k.startswith("refine_net.") for k in dec_state["model"].keys())
-    logger.info(f"  Decoder loaded (BPS + scheme-B token conditioning, RefineNet={'✓' if has_refine else '✗'})")
+
+    if cnet_state.get("config", {}) and rnet_state.get("config", {}):
+        cnet_model_cfg = cnet_state["config"].get("model_config")
+        rnet_model_cfg = rnet_state["config"].get("model_config")
+        if cnet_model_cfg != rnet_model_cfg:
+            logger.warning(
+                f"  Decoder config mismatch: best_cnet={cnet_model_cfg} "
+                f"best_rnet={rnet_model_cfg}"
+            )
+    _load_decoder_stage(
+        decoder, args.decoder_cnet_ckpt, device,
+        only_prefixes=("token_encoder", "bps_set_encoder", "bps_slot_predictor", "coarse_net"),
+        stage_name="CoarseNet"
+    )
+    _load_decoder_stage(
+        decoder, args.decoder_rnet_ckpt, device,
+        only_prefixes=("refine_net",),
+        stage_name="RefineNet"
+    )
+    has_refine = True
+    logger.info("  Decoder loaded from separate best_cnet.pt + best_rnet.pt ✓")
 
     # BPS basis for object encoding
     bps_path = dec_cfg.get("bps_path", args.bps_path)
@@ -163,13 +222,14 @@ def load_models(args, device):
 
 
 def _compute_bps(obj_pc, bps_basis):
-    """Compute BPS encoding for a single object point cloud.
+    """Compute BPS distances and nearest normalized object points.
 
     Args:
         obj_pc: (1, N, 3) object point cloud
         bps_basis: (K, 3) BPS basis points (K=4096 typically)
     Returns:
         bps_object: (1, K) BPS distance encoding
+        bps_nn_points: (1, K, 3) nearest normalized object points
     """
     from bps_torch.bps import bps_torch
 
@@ -186,8 +246,11 @@ def _compute_bps(obj_pc, bps_basis):
         basis = basis.squeeze(0)
 
     bps = bps_torch(custom_basis=basis.cpu(), device=obj_pc.device)
-    result = bps.encode(obj_pc_norm.squeeze(0), feature_type='dists')
-    return result['dists'].reshape(1, -1)
+    result = bps.encode(obj_pc_norm.squeeze(0), feature_type=['dists', 'closest'])
+    return (
+        result['dists'].reshape(1, -1),
+        result['closest'].reshape(1, -1, 3),
+    )
 
 
 def load_bps_slot_cache(args, split):
@@ -202,19 +265,34 @@ def load_bps_slot_cache(args, split):
                      f"will compute BPS online for inference")
         return None
 
+    has_nn_points = False
+    for fname in sorted(os.listdir(slot_dir)):
+        if not fname.endswith(".npz"):
+            continue
+        npz_path = os.path.join(slot_dir, fname)
+        with np.load(npz_path, allow_pickle=True) as data:
+            has_nn_points = "bps_nn_points" in data.files
+        break
+
     # Just store the directory path; load individual files on demand
     logger.info(f"BPS slot cache: {slot_dir}")
-    return {"dir": slot_dir, "cache": {}}
+    if not has_nn_points:
+        logger.info(
+            "  Cache format is legacy: bps_nn_points not found. "
+            "Re-run preprocess/build_bps_slot_cache.py if you need nearest normalized object points."
+        )
+    return {"dir": slot_dir, "cache": {}, "has_nn_points": has_nn_points}
 
 
 def get_bps_slot_data(bps_slot_cache, obj_id, device):
     """Get per-object BPS slot data from cache.
 
     Returns:
-        (bps_dists, bps_slot_labels) tensors, or (None, None) if not found.
+        (bps_dists, bps_slot_labels, bps_nn_points) tensors,
+        where bps_nn_points may be None for legacy caches.
     """
     if bps_slot_cache is None or not obj_id:
-        return None, None
+        return None, None, None
 
     cache = bps_slot_cache["cache"]
     if obj_id not in cache:
@@ -224,22 +302,30 @@ def get_bps_slot_data(bps_slot_cache, obj_id, device):
             cache[obj_id] = {
                 "bps_dists": data["bps_dists"].astype(np.float32),
                 "bps_slot_labels": data["bps_slot_labels"].astype(np.int64),
+                "bps_nn_points": (
+                    data["bps_nn_points"].astype(np.float32)
+                    if "bps_nn_points" in data.files else None
+                ),
             }
         else:
             cache[obj_id] = None
 
     entry = cache.get(obj_id)
     if entry is None:
-        return None, None
+        return None, None, None
 
     bps_dists = torch.from_numpy(entry["bps_dists"]).unsqueeze(0).to(device)
     bps_slot_labels = torch.from_numpy(entry["bps_slot_labels"]).unsqueeze(0).to(device)
-    return bps_dists, bps_slot_labels
+    bps_nn_points = None
+    if entry["bps_nn_points"] is not None:
+        bps_nn_points = torch.from_numpy(entry["bps_nn_points"]).unsqueeze(0).to(device)
+    return bps_dists, bps_slot_labels, bps_nn_points
 
 
 @torch.no_grad()
 def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
-                    bps_dists_cached=None):
+                    bps_dists_cached=None, bps_slot_labels_cached=None,
+                    bps_nn_points_cached=None):
     diffusion_obj_enc = models["diffusion_obj_enc"]
     denoiser = models["denoiser"]
     diffusion = models["diffusion"]
@@ -272,14 +358,17 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
     inferred_mask = tokens != models["pad_token_id"]
 
     # ---- Stage 2: CVAE decoder → coarse pose → RefineNet ----
-    if bps_dists_cached is not None:
-        # Use cached BPS dists from slot cache (normalized per-object)
+    if bps_dists_cached is not None and bps_nn_points_cached is not None:
+        # Use cached BPS features from slot cache (normalized per-object)
         bps_object = bps_dists_cached
+        bps_nn_points = bps_nn_points_cached
     else:
-        bps_object = _compute_bps(obj_pc, bps_basis)
+        bps_object, bps_nn_points = _compute_bps(obj_pc, bps_basis)
 
     pred = decoder.sample(
         bps_object, tokens, inferred_mask,
+        bps_nn_points=bps_nn_points,
+        bps_slot_labels=bps_slot_labels_cached,
     )
 
     final_pose = pred.pose
@@ -315,7 +404,8 @@ def main():
     parser = argparse.ArgumentParser("Generate grasps (v18, diffusion + CVAE decoder + RefineNet)")
 
     parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/diffusion/best.pt")
-    parser.add_argument("--decoder_ckpt", type=str, default="checkpoints/decoder/best.pt")
+    parser.add_argument("--decoder_cnet_ckpt", type=str, default="checkpoints/decoder/best_cnet.pt")
+    parser.add_argument("--decoder_rnet_ckpt", type=str, default="checkpoints/decoder/best_rnet.pt")
 
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--oi_category", type=str, default="all")
@@ -418,7 +508,10 @@ def main():
     logger.info(f"  Temperature:     {args.temperature}")
     logger.info(f"  Guidance scale:  {args.guidance_scale}")
     logger.info(f"  Text condition:  {text_mode}")
-    logger.info(f"  BPS slot cache:  {'loaded (cached BPS dists available)' if bps_slot_cache else 'none (compute BPS online)'}")
+    logger.info(
+        f"  BPS slot cache:  "
+        f"{'loaded (cached BPS dists/slots/nn-points when available)' if bps_slot_cache else 'none (compute BPS online)'}"
+    )
     logger.info(f"  Output:          {results_dir}")
     logger.info("=" * 60)
 
@@ -442,7 +535,7 @@ def main():
         obj_id = oi_sample.get("obj_id", f"obj_{si:05d}")
 
         # BPS slot cache lookup by obj_id
-        bps_dists_cached, _ = get_bps_slot_data(
+        bps_dists_cached, bps_slot_labels_cached, bps_nn_points_cached = get_bps_slot_data(
             bps_slot_cache, obj_id, device)
 
         if text_mode == "cache":
@@ -455,6 +548,8 @@ def main():
         hand_verts, hand_joints, mano_params, tokens = generate_single(
             models, obj_pc, obj_vn, args, text_feat=text_feat,
             bps_dists_cached=bps_dists_cached,
+            bps_slot_labels_cached=bps_slot_labels_cached,
+            bps_nn_points_cached=bps_nn_points_cached,
         )
 
         grasp_result = {

@@ -6,12 +6,13 @@ GrabNet-style CVAE (CoarseNet) with BPS + contact token conditioning.
 Architecture (following GrabNet Figure 7(2) intent conditioning):
   TokenHistogramEncoder : tokens -> raw 24D histogram
   BPSSetEncoder         : [bps_nn_points | bps_slot_labels] -> slot_feat(B, S, Ds)
-  CoarseNet CVAE        : [BPS(4096) | tok_hist(24) | slot_context(Ds)] -> rot6d(96) + trans(3)
+  CoarseNet CVAE        : [BPS(4096) | tok_hist(24) | slot_context(Ds) | text_global] -> rot6d(96) + trans(3)
   BPSSlotPredictor      : (auxiliary) predict bps_slot_labels for Part-Contact Loss
 
 BPS and token conditioning are still kept explicit: CoarseNet first aggregates the
-per-slot BPS features with token-derived slot weights, then concatenates the
-resulting slot_context with raw BPS and the token histogram.
+per-slot BPS features with token-guided attention, then concatenates the
+resulting slot_context with raw BPS, the token histogram, and an optional
+global CLIP text feature at the decoder input.
 
 RefineNet is integrated as a sub-module of PoseGrabModel (joint-trained, see train_decoder.py).
 No shape prediction — uses mean hand shape (following GrabNet).
@@ -109,10 +110,10 @@ class CoarseNet(nn.Module):
 
     Follows GrabNet Figure 7(2) intent-conditioning pattern:
       Encoder: [bps_raw(4096) | orient(9) | trans(3) | tok_hist(24) | slot_context(Ds)] → z(16)
-      Decoder: [z(16) | BN(bps_raw)(4096) | tok_hist(24) | slot_context(Ds)] → rot6d(96) + trans(3)
+      Decoder: [z(16) | BN(bps_raw)(4096) | tok_hist(24) | slot_context(Ds) | text_global] → rot6d(96) + trans(3)
 
-    slot_context is produced inside CoarseNet via token-conditioned aggregation
-    over per-slot BPS features.
+    slot_context is produced inside CoarseNet via a lightweight token-query
+    cross-attention over per-slot BPS features.
     """
 
     def __init__(
@@ -123,6 +124,7 @@ class CoarseNet(nn.Module):
         in_pose: int = 12,
         token_cond_dim: int = NUM_HAND_PARTS * NUM_SLOTS,
         slot_context_dim: int = 64,
+        text_feat_dim: int = 0,
         num_slots: int = NUM_SLOTS,
     ):
         super().__init__()
@@ -131,12 +133,23 @@ class CoarseNet(nn.Module):
         self.in_pose = in_pose
         self.token_cond_dim = token_cond_dim
         self.slot_context_dim = slot_context_dim
+        self.text_feat_dim = text_feat_dim
+        self.use_text_decoder = text_feat_dim > 0
         self.num_slots = num_slots
         if token_cond_dim % max(num_slots, 1) != 0:
             raise ValueError(
                 f"token_cond_dim={token_cond_dim} must be divisible by num_slots={num_slots}"
             )
         self.num_hand_parts = token_cond_dim // max(num_slots, 1)
+
+        self.slot_query_proj = nn.Sequential(
+            nn.Linear(token_cond_dim, slot_context_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(slot_context_dim, slot_context_dim),
+        )
+        self.slot_key_proj = nn.Linear(slot_context_dim, slot_context_dim)
+        self.slot_value_proj = nn.Linear(slot_context_dim, slot_context_dim)
+        self.slot_out_proj = nn.Linear(slot_context_dim, slot_context_dim)
 
         # ---- Encoder: bps_raw + GT pose + tok_hist + slot_context → z ----
         # Independent BN per signal prevents 4096D BPS from dominating smaller conditions.
@@ -150,11 +163,15 @@ class CoarseNet(nn.Module):
         self.enc_mu = nn.Linear(n_neurons, latentD)
         self.enc_var = nn.Linear(n_neurons, latentD)
 
-        # ---- Decoder: z + bps_raw + tok_hist + slot_context → rot6d + trans ----
-        dec_in = latentD + in_bps + token_cond_dim + slot_context_dim
+        # ---- Decoder: z + bps_raw + tok_hist + slot_context (+ text_global) → rot6d + trans ----
+        dec_in = latentD + in_bps + token_cond_dim + slot_context_dim + (
+            text_feat_dim if self.use_text_decoder else 0
+        )
         self.dec_bn_bps = nn.BatchNorm1d(in_bps)
         self.dec_bn_tok = nn.BatchNorm1d(token_cond_dim)
         self.dec_bn_slot = nn.BatchNorm1d(slot_context_dim)
+        if self.use_text_decoder:
+            self.dec_bn_text = nn.BatchNorm1d(text_feat_dim)
         self.dec_rb1 = ResBlock(dec_in, n_neurons)
         self.dec_rb2 = ResBlock(n_neurons + dec_in, n_neurons)
         self.dec_pose = nn.Linear(n_neurons, NUM_JOINTS * 6)
@@ -172,21 +189,34 @@ class CoarseNet(nn.Module):
         tok_summary: torch.Tensor,  # (B, P*S)
         slot_feat: torch.Tensor,    # (B, S, Ds)
     ) -> torch.Tensor:
-        """Aggregate per-slot geometry features using token-derived slot weights."""
+        """Aggregate slot features with token-guided cross-attention."""
         bs = tok_summary.shape[0]
         if slot_feat.ndim != 3 or slot_feat.shape[1] != self.num_slots:
             raise ValueError(
                 f"slot_feat must have shape (B, {self.num_slots}, Ds), got {tuple(slot_feat.shape)}"
             )
 
-        slot_weights = tok_summary.reshape(bs, self.num_hand_parts, self.num_slots).sum(dim=1)
-        slot_sum = slot_weights.sum(dim=1, keepdim=True)
-        slot_weights = slot_weights / slot_sum.clamp(min=1.0)
-        slot_context = torch.sum(slot_feat * slot_weights.unsqueeze(-1), dim=1)
+        slot_mask = slot_feat.abs().sum(dim=-1) > 0
+        has_slot = slot_mask.any(dim=1)
+        if not has_slot.any():
+            return slot_feat.new_zeros(bs, self.slot_context_dim)
 
-        empty = slot_sum.squeeze(1) <= 0
-        if empty.any():
-            slot_context[empty] = 0.0
+        query = self.slot_query_proj(tok_summary)
+        key = self.slot_key_proj(slot_feat)
+        value = self.slot_value_proj(slot_feat)
+
+        scores = torch.einsum("bd,bsd->bs", query, key)
+        scores = scores / max(self.slot_context_dim ** 0.5, 1.0)
+        scores = scores.masked_fill(~slot_mask, -1e4)
+
+        attn = torch.softmax(scores, dim=1)
+        attn = attn * has_slot.unsqueeze(1).to(attn.dtype)
+        attn = attn / attn.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+        slot_context = torch.sum(value * attn.unsqueeze(-1), dim=1)
+        slot_context = self.slot_out_proj(slot_context)
+        if (~has_slot).any():
+            slot_context[~has_slot] = 0.0
         return slot_context
 
     def encode(
@@ -222,6 +252,7 @@ class CoarseNet(nn.Module):
         bps_raw: torch.Tensor,
         tok_summary: torch.Tensor,
         slot_feat: torch.Tensor,
+        text_feat: torch.Tensor | None = None,
     ) -> dict:
         """Decode z + bps_raw + token histogram + slot_context → pose + trans.
 
@@ -235,7 +266,22 @@ class CoarseNet(nn.Module):
         o_bps = self.dec_bn_bps(bps_raw)
         o_tok = self.dec_bn_tok(tok_summary)
         o_slot = self.dec_bn_slot(slot_context)
-        X0 = torch.cat([z, o_bps, o_tok, o_slot], dim=1)
+        decoder_inputs = [z, o_bps, o_tok, o_slot]
+        if self.use_text_decoder:
+            if text_feat is None:
+                text_feat = torch.zeros(
+                    bps_raw.shape[0],
+                    self.text_feat_dim,
+                    device=bps_raw.device,
+                    dtype=bps_raw.dtype,
+                )
+            elif text_feat.shape != (bps_raw.shape[0], self.text_feat_dim):
+                raise ValueError(
+                    f"text_feat must have shape {(bps_raw.shape[0], self.text_feat_dim)}, "
+                    f"got {tuple(text_feat.shape)}"
+                )
+            decoder_inputs.append(self.dec_bn_text(text_feat))
+        X0 = torch.cat(decoder_inputs, dim=1)
         X = self.dec_rb1(X0, True)
         X = self.dec_rb2(torch.cat([X0, X], dim=1), True)
 
@@ -254,6 +300,7 @@ class CoarseNet(nn.Module):
         global_orient_rhand_rotmat: torch.Tensor,
         tok_summary: torch.Tensor,
         slot_feat: torch.Tensor,
+        text_feat: torch.Tensor | None = None,
         **kwargs,
     ) -> dict:
         """Training forward: encode GT → sample z → decode.
@@ -269,7 +316,7 @@ class CoarseNet(nn.Module):
             bps_raw, trans_rhand, global_orient_rhand_rotmat, tok_summary, slot_feat
         )
         z_s = z_dist.rsample()
-        results = self.decode(z_s, bps_raw, tok_summary, slot_feat)
+        results = self.decode(z_s, bps_raw, tok_summary, slot_feat, text_feat=text_feat)
         results["mean"] = z_dist.mean
         results["std"] = z_dist.scale
         return results
@@ -280,6 +327,7 @@ class CoarseNet(nn.Module):
         bps_raw: torch.Tensor,
         tok_summary: torch.Tensor,
         slot_feat: torch.Tensor,
+        text_feat: torch.Tensor | None = None,
         seed: int | None = None,
     ) -> dict:
         """Sample from prior: z ~ N(0, I) → decode."""
@@ -289,7 +337,7 @@ class CoarseNet(nn.Module):
         if seed is not None:
             np.random.seed(seed)
         z = torch.randn(bs, self.latentD, device=device, dtype=dtype)
-        return self.decode(z, bps_raw, tok_summary, slot_feat)
+        return self.decode(z, bps_raw, tok_summary, slot_feat, text_feat=text_feat)
 
 
 # ==============================================================================
@@ -488,7 +536,7 @@ class PoseGrabModel(nn.Module):
       - TokenHistogramEncoder : tokens → raw 24D histogram
       - BPSSetEncoder         : [bps_nn_points, bps_slot_labels] → slot_feat(B, S, Ds)
       - BPSSlotPredictor      : (auxiliary) predict bps_slot_labels for Part-Contact Loss
-      - CoarseNet             : CVAE, [BPS ‖ tok_hist ‖ slot_context] → rot6d + trans
+      - CoarseNet             : CVAE, [BPS ‖ tok_hist ‖ slot_context ‖ text_global] → rot6d + trans
       - RefineNet             : iterative geometry-based refinement (h2o_dist → delta)
     """
 
@@ -505,6 +553,7 @@ class PoseGrabModel(nn.Module):
         latentD: int = 16,
         in_bps: int = 4096,
         n_betas: int = DEFAULT_N_BETAS,
+        text_feat_dim: int = 0,
         kl_coef: float = 0.005,
         bps_slot_predictor_hidden: int = 256,
         refine_n_iters: int = 3,
@@ -522,6 +571,7 @@ class PoseGrabModel(nn.Module):
         self.kl_coef = kl_coef
         self.latentD = latentD
         self.no_token_cond = False   # ablation flag
+        self.no_per_slot_feat = False   # ablation flag
 
         # Token → raw 24D histogram
         self.token_encoder = TokenHistogramEncoder(
@@ -548,6 +598,7 @@ class PoseGrabModel(nn.Module):
             in_bps=in_bps,
             token_cond_dim=token_embed_dim,
             slot_context_dim=slot_feat_dim,
+            text_feat_dim=text_feat_dim,
             num_slots=num_slots,
         )
 
@@ -564,6 +615,7 @@ class PoseGrabModel(nn.Module):
     def predict_slot_labels(
         self,
         bps_dists: torch.Tensor,
+        bps_nn_points: torch.Tensor | None = None,
         tokens: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -573,7 +625,10 @@ class PoseGrabModel(nn.Module):
             (B, K) long, values in {-1, 0, …, num_slots-1}
         """
         del tokens, token_mask
-        return self.bps_slot_predictor.predict(bps_dists)
+        return self.bps_slot_predictor.predict(
+            bps_dists,
+            bps_nn_points=bps_nn_points,
+        )
 
     # ----------------------------------------------------------------
     # Coarse stage (CVAE)
@@ -602,14 +657,21 @@ class PoseGrabModel(nn.Module):
         if bps_nn_points is None:
             raise ValueError("bps_nn_points is required for BPSSetEncoder.")
         if bps_slot_labels is None:
-            bps_slot_labels = self.predict_slot_labels(bps_dists)
-        return self.bps_set_encoder(bps_nn_points, bps_slot_labels)
+            bps_slot_labels = self.predict_slot_labels(
+                bps_dists,
+                bps_nn_points=bps_nn_points,
+            )
+        slot_feat = self.bps_set_encoder(bps_nn_points, bps_slot_labels)
+        if self.no_per_slot_feat:
+            slot_feat = torch.zeros_like(slot_feat)
+        return slot_feat
 
     def forward_coarse(
         self,
         bps_raw: torch.Tensor,
         tok_summary: torch.Tensor,
         slot_feat: torch.Tensor,
+        text_feat: torch.Tensor | None,
         trans_rhand: torch.Tensor,
         global_orient_rhand_rotmat: torch.Tensor,
     ) -> dict:
@@ -623,7 +685,12 @@ class PoseGrabModel(nn.Module):
             global_orient_rhand_rotmat: (B, 9) GT global orient
         """
         return self.coarse_net(
-            bps_raw, trans_rhand, global_orient_rhand_rotmat, tok_summary, slot_feat,
+            bps_raw,
+            trans_rhand,
+            global_orient_rhand_rotmat,
+            tok_summary,
+            slot_feat,
+            text_feat=text_feat,
         )
 
     def compute_coarse_loss(
@@ -714,6 +781,7 @@ class PoseGrabModel(nn.Module):
         mask: torch.Tensor,
         bps_nn_points: torch.Tensor,
         bps_slot_labels: torch.Tensor | None = None,
+        text_feat: torch.Tensor | None = None,
         n_betas: int | None = None,
         seed: int | None = None,
         **kwargs,
@@ -735,7 +803,7 @@ class PoseGrabModel(nn.Module):
         tok_summary = self.encode_token_condition(tokens, mask)
         slot_feat = self.encode_bps_condition(bps_dists, bps_nn_points, bps_slot_labels)
         results = self.coarse_net.sample_poses(
-            bps_dists, tok_summary, slot_feat, seed=seed
+            bps_dists, tok_summary, slot_feat, text_feat=text_feat, seed=seed
         )
 
         pose_aa = results["fullpose_aa"]
@@ -757,6 +825,7 @@ class PoseGrabModel(nn.Module):
         bps_slot_labels: torch.Tensor | None = None,
         trans_rhand: torch.Tensor | None = None,
         global_orient_rhand_rotmat: torch.Tensor | None = None,
+        text_feat: torch.Tensor | None = None,
         **kwargs,
     ):
         """Training forward: if GT is provided, run CVAE. Otherwise sample."""
@@ -765,10 +834,20 @@ class PoseGrabModel(nn.Module):
 
         if trans_rhand is not None and global_orient_rhand_rotmat is not None:
             return self.forward_coarse(
-                bps_dists, tok_summary, slot_feat, trans_rhand, global_orient_rhand_rotmat
+                bps_dists,
+                tok_summary,
+                slot_feat,
+                text_feat,
+                trans_rhand,
+                global_orient_rhand_rotmat,
             )
         else:
-            return self.coarse_net.sample_poses(bps_dists, tok_summary, slot_feat)
+            return self.coarse_net.sample_poses(
+                bps_dists,
+                tok_summary,
+                slot_feat,
+                text_feat=text_feat,
+            )
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

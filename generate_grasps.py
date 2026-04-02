@@ -163,7 +163,23 @@ def load_models(args, device):
         dec_cfg.get("model_config", args.decoder_config),
         vocab_size=dec_cfg.get("vocab_size", vocab_size),
         n_betas=dec_cfg.get("n_betas", args.n_betas),
+        text_feat_dim=(
+            dec_cfg.get("text_feat_dim", args.text_feat_dim)
+            if dec_cfg.get("use_text_cond", False)
+            else 0
+        ),
     ).to(device)
+    if dec_cfg.get("no_token_cond", False):
+        decoder.no_token_cond = True
+        logger.info("  Decoder ablation from checkpoint: token conditioning DISABLED")
+    if dec_cfg.get("no_per_slot_feat", False):
+        decoder.no_per_slot_feat = True
+        logger.info("  Decoder ablation from checkpoint: per-slot feature DISABLED")
+    if dec_cfg.get("use_text_cond", False):
+        logger.info(
+            f"  Decoder text conditioning from checkpoint: enabled "
+            f"(dim={dec_cfg.get('text_feat_dim', args.text_feat_dim)})"
+        )
 
     if cnet_state.get("config", {}) and rnet_state.get("config", {}):
         cnet_model_cfg = cnet_state["config"].get("model_config")
@@ -322,8 +338,33 @@ def get_bps_slot_data(bps_slot_cache, obj_id, device):
     return bps_dists, bps_slot_labels, bps_nn_points
 
 
+def resolve_slot_labels_for_decoder(slot_label_source, bps_slot_labels_cached, obj_id):
+    """Resolve which slot labels should be fed into the decoder.
+
+    Returns:
+        slot_labels_for_decoder: tensor or None
+        source_used: one of {"gt", "predictor"}
+    """
+    if slot_label_source == "gt":
+        if bps_slot_labels_cached is None:
+            raise RuntimeError(
+                "GT slot labels requested, but no cached bps_slot_labels were found "
+                f"for obj_id='{obj_id}'. Run preprocess/build_bps_slot_cache.py first "
+                "or switch --slot_label_source to predictor."
+            )
+        return bps_slot_labels_cached, "gt"
+
+    if slot_label_source == "predictor":
+        return None, "predictor"
+
+    # auto: prefer GT cache when available, otherwise fall back to predictor
+    if bps_slot_labels_cached is not None:
+        return bps_slot_labels_cached, "gt"
+    return None, "predictor"
+
+
 @torch.no_grad()
-def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
+def generate_single(models, obj_pc, obj_vn, args, text_feat=None, decoder_text_feat=None,
                     bps_dists_cached=None, bps_slot_labels_cached=None,
                     bps_nn_points_cached=None):
     diffusion_obj_enc = models["diffusion_obj_enc"]
@@ -369,6 +410,7 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
         bps_object, tokens, inferred_mask,
         bps_nn_points=bps_nn_points,
         bps_slot_labels=bps_slot_labels_cached,
+        text_feat=decoder_text_feat,
     )
 
     final_pose = pred.pose
@@ -440,6 +482,18 @@ def main():
     # Slot-grounded BPS
     parser.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                         help="Per-object BPS slot cache directory")
+    parser.add_argument(
+        "--slot_label_source",
+        type=str,
+        default="predictor",
+        choices=["auto", "gt", "predictor"],
+        help=(
+            "Source of BPS slot labels for the decoder: "
+            "'gt' uses cached GT labels, "
+            "'predictor' uses decoder.bps_slot_predictor outputs, "
+            "'auto' prefers GT cache and falls back to predictor."
+        ),
+    )
 
     parser.add_argument("--save_dir", type=str, default="experiments/generated")
     parser.add_argument("--save_mesh", action="store_true")
@@ -498,6 +552,12 @@ def main():
 
     # Load BPS slot cache for inference (per-object BPS dists + slot labels)
     bps_slot_cache = load_bps_slot_cache(args, args.split)
+    if args.slot_label_source == "gt" and bps_slot_cache is None:
+        logger.error(
+            "GT slot labels requested via --slot_label_source gt, "
+            f"but no BPS slot cache was found under {args.bps_slot_cache_dir}/{args.split}."
+        )
+        sys.exit(1)
 
     logger.info("=" * 60)
     logger.info(f"  Split:           {args.split}")
@@ -508,6 +568,12 @@ def main():
     logger.info(f"  Temperature:     {args.temperature}")
     logger.info(f"  Guidance scale:  {args.guidance_scale}")
     logger.info(f"  Text condition:  {text_mode}")
+    slot_label_desc = {
+        "auto": "auto (prefer GT cache, else predictor)",
+        "gt": "gt cache",
+        "predictor": "decoder predictor",
+    }[args.slot_label_source]
+    logger.info(f"  Slot labels:     {slot_label_desc}")
     logger.info(
         f"  BPS slot cache:  "
         f"{'loaded (cached BPS dists/slots/nn-points when available)' if bps_slot_cache else 'none (compute BPS online)'}"
@@ -537,18 +603,30 @@ def main():
         # BPS slot cache lookup by obj_id
         bps_dists_cached, bps_slot_labels_cached, bps_nn_points_cached = get_bps_slot_data(
             bps_slot_cache, obj_id, device)
+        try:
+            bps_slot_labels_for_decoder, slot_label_source_used = resolve_slot_labels_for_decoder(
+                args.slot_label_source,
+                bps_slot_labels_cached,
+                obj_id,
+            )
+        except RuntimeError as e:
+            logger.error(str(e))
+            sys.exit(1)
 
         if text_mode == "cache":
             text_str = idx_to_text.get(si, "no contact")
             text_feat = clip_enc.encode([text_str])
+            decoder_text_feat = clip_enc.encode_global([text_str])
         else:
             text_feat = None
+            decoder_text_feat = None
             text_str = ""
 
         hand_verts, hand_joints, mano_params, tokens = generate_single(
             models, obj_pc, obj_vn, args, text_feat=text_feat,
+            decoder_text_feat=decoder_text_feat,
             bps_dists_cached=bps_dists_cached,
-            bps_slot_labels_cached=bps_slot_labels_cached,
+            bps_slot_labels_cached=bps_slot_labels_for_decoder,
             bps_nn_points_cached=bps_nn_points_cached,
         )
 
@@ -564,6 +642,8 @@ def main():
             "tokens": tokens,
             "obj_rotmat": np.eye(3, dtype=np.float32),
             "text": text_str,
+            "slot_label_source": args.slot_label_source,
+            "slot_label_source_used": slot_label_source_used,
         }
 
         fname = f"{obj_id}_{si:05d}"

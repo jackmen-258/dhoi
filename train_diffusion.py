@@ -17,6 +17,7 @@ import time
 import random
 import argparse
 import logging
+from collections import defaultdict
 
 from dataclasses import dataclass
 from typing import Dict
@@ -24,6 +25,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
@@ -177,6 +179,8 @@ class DiffusionTrainDataset(Dataset):
             "obj_pc": torch.from_numpy(obj_pc),
             "obj_vn": torch.from_numpy(obj_vn),
             "text": self._text_map.get(entry["cache_file"], ""),
+            "sample_id": os.path.splitext(entry["cache_file"])[0],
+            "cache_file": entry["cache_file"],
         }
 
 
@@ -187,6 +191,65 @@ def _collate_fn(batch):
         "obj_pc": torch.stack([b["obj_pc"] for b in batch]),
         "obj_vn": torch.stack([b["obj_vn"] for b in batch]),
         "text": [b["text"] for b in batch],
+        "sample_id": [b["sample_id"] for b in batch],
+        "cache_file": [b["cache_file"] for b in batch],
+    }
+
+
+def _semantic_token_hist(
+    tokens: torch.Tensor,
+    semantic_mask: torch.Tensor,
+    n_semantic: int,
+) -> torch.Tensor:
+    """Build per-sample semantic token histograms while ignoring PAD/MASK/order."""
+    tok_ids = tokens.clamp(min=0, max=n_semantic - 1)
+    one_hot = F.one_hot(tok_ids, n_semantic).float()
+    return (one_hot * semantic_mask.unsqueeze(-1).float()).sum(dim=1)
+
+
+@torch.no_grad()
+def compute_stage1_token_noise_stats(
+    pred_tokens: torch.Tensor,
+    gt_tokens: torch.Tensor,
+    gt_token_mask: torch.Tensor,
+    n_semantic: int,
+) -> dict:
+    """Decompose Stage-1 token errors into drop / substitution / insertion counts.
+
+    Since the semantic token set is unordered, we compare multisets rather than
+    sequence positions:
+      - missing = GT semantic tokens not recovered by Stage 1
+      - extra   = predicted semantic tokens absent from GT
+      - sub     = min(missing, extra)
+      - drop    = missing - sub
+      - insert  = extra - sub
+
+    This decomposition lets Stage 2 map observed Stage-1 errors to the two
+    augmentation knobs it actually has: dropout and substitution.
+    """
+    pred_sem_mask = (pred_tokens >= 0) & (pred_tokens < n_semantic)
+    gt_sem_mask = gt_token_mask.bool() & (gt_tokens >= 0) & (gt_tokens < n_semantic)
+
+    pred_hist = _semantic_token_hist(pred_tokens, pred_sem_mask, n_semantic)
+    gt_hist = _semantic_token_hist(gt_tokens, gt_sem_mask, n_semantic)
+
+    matched = torch.minimum(pred_hist, gt_hist)
+    gt_count = gt_hist.sum(dim=1)
+    pred_count = pred_hist.sum(dim=1)
+    missing = (gt_hist - matched).clamp(min=0).sum(dim=1)
+    extra = (pred_hist - matched).clamp(min=0).sum(dim=1)
+    sub = torch.minimum(missing, extra)
+    drop = missing - sub
+    insert = extra - sub
+
+    return {
+        "gt_count": gt_count,
+        "pred_count": pred_count,
+        "missing_count": missing,
+        "extra_count": extra,
+        "sub_count": sub,
+        "drop_count": drop,
+        "insert_count": insert,
     }
 
 
@@ -326,6 +389,30 @@ class DiffusionTrainer:
                 pin_memory=True,
                 collate_fn=_collate_fn,
             )
+
+    def _build_split_dataloader(
+        self,
+        cache_dir: str,
+        split: str,
+        batch_size: int | None = None,
+    ):
+        ds = DiffusionTrainDataset(
+            cache_dir=cache_dir,
+            config_path=self.cfg.config_path,
+            split=split,
+            n_pc_points=self.cfg.n_pc_points,
+            category=self.cfg.oi_category,
+            intent=self.cfg.oi_intent,
+        )
+        dl = DataLoader(
+            ds,
+            batch_size=batch_size or self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            collate_fn=_collate_fn,
+        )
+        return ds, dl
 
     def _build_optimizer(self):
         cfg = self.cfg
@@ -560,6 +647,160 @@ class DiffusionTrainer:
                 f"  [{i}] Pred: {pred_toks}  (sem={pred_sem}, pad={pred_pad})"
             )
 
+    @staticmethod
+    def _slice_batch(batch, n_keep: int):
+        sliced = {}
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                sliced[k] = v[:n_keep]
+            elif isinstance(v, list):
+                sliced[k] = v[:n_keep]
+            else:
+                sliced[k] = v
+        return sliced
+
+    @torch.no_grad()
+    def analyze_stage1_token_noise(
+        self,
+        split: str = "test",
+        cache_dir: str = "cache/contact_tokens/test",
+        out_path: str | None = None,
+        batch_size: int | None = None,
+        temperature: float = 0.9,
+        guidance_scale: float = 2.0,
+        max_samples: int = 0,
+        adaptive_pivot: int = 6,
+    ) -> dict:
+        """Estimate Stage-1 semantic token noise for Stage-2 augmentation calibration."""
+        ds, dl = self._build_split_dataloader(cache_dir, split, batch_size=batch_size)
+        n_semantic = ds.mapper.num_semantic_tokens
+        seq_len = ds.encoder.max_token_length
+
+        was_training_denoiser = self.denoiser.training
+        was_training_obj = self.obj_enc.training
+        self.denoiser.eval()
+        self.obj_enc.eval()
+
+        totals = defaultdict(float)
+        per_sample = []
+        seen = 0
+
+        for batch in dl:
+            if max_samples > 0 and seen >= max_samples:
+                break
+            if max_samples > 0:
+                remaining = max_samples - seen
+                if remaining < len(batch["sample_id"]):
+                    batch = self._slice_batch(batch, remaining)
+
+            gt_tokens = batch["token_seq"].to(self.device)
+            gt_mask = batch["token_mask"].to(self.device).bool()
+            cond = self._build_conditions(batch, training=False)
+
+            result = self.diffusion.sample(
+                self.denoiser,
+                cond=cond,
+                batch_size=gt_tokens.shape[0],
+                seq_length=seq_len,
+                temperature=temperature,
+                guidance_scale=guidance_scale,
+                min_tokens=self.cfg.min_tokens,
+            )
+            pred_tokens = result["samples"].to(self.device)
+
+            batch_stats = compute_stage1_token_noise_stats(
+                pred_tokens=pred_tokens,
+                gt_tokens=gt_tokens,
+                gt_token_mask=gt_mask,
+                n_semantic=n_semantic,
+            )
+
+            gt_count = batch_stats["gt_count"].float()
+            adaptive_scale = (gt_count / float(adaptive_pivot)).clamp(max=1.0)
+            totals["num_samples"] += gt_tokens.shape[0]
+            totals["total_gt_tokens"] += gt_count.sum().item()
+            totals["total_pred_tokens"] += batch_stats["pred_count"].sum().item()
+            totals["total_missing_tokens"] += batch_stats["missing_count"].sum().item()
+            totals["total_extra_tokens"] += batch_stats["extra_count"].sum().item()
+            totals["total_drop_tokens"] += batch_stats["drop_count"].sum().item()
+            totals["total_sub_tokens"] += batch_stats["sub_count"].sum().item()
+            totals["total_insert_tokens"] += batch_stats["insert_count"].sum().item()
+            totals["adaptive_drop_denom"] += (gt_count * adaptive_scale).sum().item()
+
+            for i, sample_id in enumerate(batch["sample_id"]):
+                per_sample.append({
+                    "sample_id": sample_id,
+                    "cache_file": batch["cache_file"][i],
+                    "gt_tokens": int(batch_stats["gt_count"][i].item()),
+                    "pred_tokens": int(batch_stats["pred_count"][i].item()),
+                    "drop_tokens": int(batch_stats["drop_count"][i].item()),
+                    "sub_tokens": int(batch_stats["sub_count"][i].item()),
+                    "insert_tokens": int(batch_stats["insert_count"][i].item()),
+                })
+            seen += gt_tokens.shape[0]
+
+        total_gt = max(totals["total_gt_tokens"], 1.0)
+        total_remaining_after_drop = max(
+            totals["total_gt_tokens"] - totals["total_drop_tokens"], 1.0
+        )
+        adaptive_drop_denom = max(totals["adaptive_drop_denom"], 1.0)
+
+        calibrated_drop_prob = min(totals["total_drop_tokens"] / adaptive_drop_denom, 1.0)
+        calibrated_sub_prob = min(totals["total_sub_tokens"] / total_remaining_after_drop, 1.0)
+
+        summary = {
+            "split": split,
+            "cache_dir": cache_dir,
+            "checkpoint": self.cfg.resume,
+            "num_samples": int(totals["num_samples"]),
+            "temperature": float(temperature),
+            "guidance_scale": float(guidance_scale),
+            "adaptive_pivot": int(adaptive_pivot),
+            "mean_gt_tokens_per_sample": float(totals["total_gt_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_pred_tokens_per_sample": float(totals["total_pred_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_missing_tokens_per_sample": float(totals["total_missing_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_extra_tokens_per_sample": float(totals["total_extra_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_drop_tokens_per_sample": float(totals["total_drop_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_sub_tokens_per_sample": float(totals["total_sub_tokens"] / max(totals["num_samples"], 1.0)),
+            "mean_insert_tokens_per_sample": float(totals["total_insert_tokens"] / max(totals["num_samples"], 1.0)),
+            "drop_rate_per_gt_token": float(totals["total_drop_tokens"] / total_gt),
+            "sub_rate_per_surviving_gt_token": float(totals["total_sub_tokens"] / total_remaining_after_drop),
+            "calibrated_token_drop_prob": float(calibrated_drop_prob),
+            "calibrated_token_sub_prob": float(calibrated_sub_prob),
+            "notes": (
+                "missing = drop + sub, extra = insert + sub, sub = min(missing, extra). "
+                "Drop probability is calibrated against the adaptive dropout denominator "
+                "sum(k * min(k/pivot, 1)); substitution probability is calibrated on "
+                "the surviving GT token mass after drops."
+            ),
+            "per_sample": per_sample,
+        }
+
+        if out_path:
+            out_dir = os.path.dirname(out_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"[Stage1 Noise] Saved stats to {out_path}")
+
+        self.logger.info(
+            "[Stage1 Noise] split=%s  samples=%d  drop/sample=%.3f  sub/sample=%.3f  "
+            "drop_prob=%.4f  sub_prob=%.4f",
+            split,
+            summary["num_samples"],
+            summary["mean_drop_tokens_per_sample"],
+            summary["mean_sub_tokens_per_sample"],
+            summary["calibrated_token_drop_prob"],
+            summary["calibrated_token_sub_prob"],
+        )
+
+        if was_training_denoiser:
+            self.denoiser.train()
+        if was_training_obj:
+            self.obj_enc.train()
+        return summary
+
     def _save_checkpoint(self, filename):
         path = os.path.join(self.cfg.save_dir, filename)
         torch.save({
@@ -612,12 +853,17 @@ def parse_args():
     p.add_argument("--denoiser_config", type=str, default="base", choices=["tiny", "small", "base"])
     p.add_argument("--obj_global_dim", type=int, default=256)
     p.add_argument("--obj_point_dim", type=int, default=256)
+    p.add_argument("--clip_model", type=str, default="ViT-B/32")
+    p.add_argument("--text_feat_dim", type=int, default=512)
+    p.add_argument("--use_text", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cond_dropout", type=float, default=0.2)
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--resume", type=str, default="")
+    p.add_argument("--log_dir", type=str, default="logs/diffusion")
+    p.add_argument("--save_dir", type=str, default="checkpoints/diffusion")
     p.add_argument("--seed", type=int, default=7725)
 
     p.add_argument("--vocab_size", type=int, default=26)
@@ -626,11 +872,68 @@ def parse_args():
     p.add_argument("--min_tokens", type=int, default=1)
     p.add_argument("--pad_logit_bias", type=float, default=0.0)
 
+    # Stage-1 token noise analysis for Stage-2 augmentation calibration
+    p.add_argument("--analyze_token_noise", action="store_true",
+                   help="Run Stage-1 token noise analysis instead of training")
+    p.add_argument("--analysis_ckpt", type=str, default="",
+                   help="Checkpoint to analyze; if set, overrides --resume for analysis mode")
+    p.add_argument("--analysis_split", type=str, default="test",
+                   choices=["train", "val", "test"],
+                   help="Dataset split used for Stage-1 token noise analysis")
+    p.add_argument("--analysis_cache_dir", type=str, default="cache/contact_tokens/test",
+                   help="Token cache dir used for Stage-1 token noise analysis")
+    p.add_argument("--analysis_out", type=str, default="",
+                   help="Optional JSON path to save Stage-1 token noise statistics")
+    p.add_argument("--analysis_batch_size", type=int, default=0,
+                   help="Batch size for analysis; 0 means reuse --batch_size")
+    p.add_argument("--analysis_temperature", type=float, default=0.9)
+    p.add_argument("--analysis_guidance_scale", type=float, default=2.0)
+    p.add_argument("--analysis_max_samples", type=int, default=0,
+                   help="Limit analysis to the first N samples; 0 means all")
+    p.add_argument("--analysis_adaptive_pivot", type=int, default=6,
+                   help="Adaptive dropout pivot used to calibrate token_drop_prob")
+
     return p.parse_args()
+
+
+def _override_args_from_checkpoint(args, ckpt_path: str):
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        return
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    saved_cfg = state.get("config", {})
+    if not isinstance(saved_cfg, dict):
+        return
+
+    keys = [
+        "config_path",
+        "n_pc_points",
+        "denoiser_config",
+        "obj_global_dim",
+        "obj_point_dim",
+        "clip_model",
+        "text_feat_dim",
+        "use_text",
+        "cond_dropout",
+        "vocab_size",
+        "pad_token_id",
+        "mask_token_id",
+        "min_tokens",
+        "pad_logit_bias",
+    ]
+    for key in keys:
+        if key in saved_cfg:
+            setattr(args, key, saved_cfg[key])
 
 
 def main():
     args = parse_args()
+    analysis_ckpt = args.analysis_ckpt or args.resume
+    if args.analyze_token_noise and not analysis_ckpt:
+        raise ValueError("analysis mode requires --analysis_ckpt (or --resume) to load a trained Stage-1 model")
+    if args.analyze_token_noise and analysis_ckpt:
+        _override_args_from_checkpoint(args, analysis_ckpt)
+        args.resume = analysis_ckpt
 
     cfg = TrainConfig(
         cache_dir=args.cache_dir,
@@ -640,11 +943,16 @@ def main():
         denoiser_config=args.denoiser_config,
         obj_global_dim=args.obj_global_dim,
         obj_point_dim=args.obj_point_dim,
+        clip_model=args.clip_model,
+        text_feat_dim=args.text_feat_dim,
+        use_text=args.use_text,
         cond_dropout=args.cond_dropout,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         resume=args.resume,
+        log_dir=args.log_dir,
+        save_dir=args.save_dir,
         seed=args.seed,
         vocab_size=args.vocab_size,
         pad_token_id=args.pad_token_id,
@@ -653,7 +961,27 @@ def main():
         pad_logit_bias=args.pad_logit_bias,
     )
 
-    DiffusionTrainer(cfg).train()
+    trainer = DiffusionTrainer(cfg)
+    if args.analyze_token_noise:
+        out_path = args.analysis_out
+        if not out_path:
+            out_path = os.path.join(
+                cfg.save_dir,
+                f"stage1_token_noise_{args.analysis_split}.json",
+            )
+        trainer.analyze_stage1_token_noise(
+            split=args.analysis_split,
+            cache_dir=args.analysis_cache_dir,
+            out_path=out_path,
+            batch_size=args.analysis_batch_size or cfg.batch_size,
+            temperature=args.analysis_temperature,
+            guidance_scale=args.analysis_guidance_scale,
+            max_samples=args.analysis_max_samples,
+            adaptive_pivot=args.analysis_adaptive_pivot,
+        )
+        return
+
+    trainer.train()
 
 
 if __name__ == "__main__":

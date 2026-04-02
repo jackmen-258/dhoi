@@ -63,3 +63,13 @@ class CLIPTextEncoder:
         x = x.permute(1, 0, 2)
         x = self._model.ln_final(x)
         return x.float()
+
+    @torch.no_grad()
+    def encode_global(self, texts: List[str]) -> torch.Tensor:
+        """texts → (B, 512) global CLIP text feature."""
+        self._lazy_load()
+        if self._model is None:
+            return torch.zeros(len(texts), 512, device=self.device)
+
+        tokens = self._tokenizer(texts, truncate=True).to(self.device)
+        return self._model.encode_text(tokens).float()

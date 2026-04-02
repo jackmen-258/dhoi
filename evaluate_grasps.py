@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-evaluate_grasps.py — 评估生成抓握的物理质量
+evaluate_grasps.py — 评估生成抓握的物理质量 + 语义一致性
 
 指标:
   - Penetration Depth (cm):       手穿入物体的深度, 越低越好
   - Intersection Volume (cm³):    手-物体交叉体积, 越低越好
   - Simulation Displacement (cm): 物理仿真中物体位移, 越低越好
   - Contact Ratio:                近表面接触样本比例, 越高越好
+  - Contact Token F1:             最终 hand pose 反推接触矩阵，与 conditioning tokens 的 F1
+  - Slot Hit Rate:                折叠 hand_part 后，GT slot 中被命中的比例
 
 依赖:
   - lib.metrics.penetration      (穿透深度)
@@ -28,13 +30,16 @@ from collections import defaultdict
 
 import numpy as np
 import trimesh
+import torch
 from joblib import Parallel, delayed
 from scipy.spatial import cKDTree
 
+from data.token_encoder import TokenEncoder
 from metrics.basic_metric import AverageMeter
 from metrics.penetration import penetration
 from metrics.intersection import solid_intersection_volume
 from metrics.simulator import simulation_sample
+from utils.mano_utils import MANOHelper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -151,6 +156,165 @@ def min_surface_distance(obj_mesh: trimesh.Trimesh, query_points: np.ndarray) ->
 
 
 # ==============================================================================
+# 语义指标
+# ==============================================================================
+
+def compute_contact_token_f1(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> float:
+    """
+    与 train_decoder.compute_token_recall_f1 等价的 F1（这里直接基于 contact_matrix 计算）。
+    """
+    pred_hist = (np.asarray(pred_matrix) >= 0).reshape(-1).astype(np.float32)
+    gt_hist = (np.asarray(gt_matrix) >= 0).reshape(-1).astype(np.float32)
+
+    tp = float((pred_hist * gt_hist).sum())
+    pred_pos = float(pred_hist.sum())
+    gt_pos = float(gt_hist.sum())
+
+    precision = tp / pred_pos if pred_pos > 0 else 0.0
+    recall = tp / gt_pos if gt_pos > 0 else 0.0
+
+    denom = precision + recall
+    if denom <= 0:
+        return 0.0
+    return float(2.0 * precision * recall / denom)
+
+
+def compute_shr(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> float:
+    pred_slots = (pred_matrix >= 0).any(axis=0)   # (4,) bool
+    gt_slots   = (gt_matrix >= 0).any(axis=0)     # (4,) bool
+    if not gt_slots.any():
+        return 1.0
+    return float((pred_slots & gt_slots).sum()) / float(gt_slots.sum())
+
+
+class SemanticMetricHelper:
+    """Recover contact semantics from the final hand pose and compare with tokens."""
+
+    def __init__(
+        self,
+        config_path: str,
+        mano_assets_root: str,
+        bps_path: str,
+        bps_slot_cache_dir: str,
+        split: str,
+        contact_distance: float,
+    ):
+        self.token_encoder = TokenEncoder(config_path)
+        self.num_hand_parts = self.token_encoder.num_hand_parts
+        self.num_slots = self.token_encoder.num_slots
+        self.contact_distance = float(contact_distance)
+
+        slot_dir = os.path.join(bps_slot_cache_dir, split)
+        if not os.path.isdir(slot_dir):
+            raise FileNotFoundError(f"BPS slot cache dir not found: {slot_dir}")
+        self.slot_dir = slot_dir
+
+        if not os.path.exists(bps_path):
+            raise FileNotFoundError(f"BPS basis not found: {bps_path}")
+        bps_data = np.load(bps_path)
+        self.bps_basis = bps_data["basis"].astype(np.float32)
+        if self.bps_basis.ndim == 3:
+            self.bps_basis = self.bps_basis.squeeze(0)
+
+        mano = MANOHelper(mano_assets_root, device="cpu")
+        self.vert_to_part = self._build_vert_to_part(mano)
+        self._slot_cache = {}
+
+    def _build_vert_to_part(self, mano: MANOHelper) -> np.ndarray:
+        weights = mano.mano.th_weights.detach().cpu().numpy()  # (778, 16)
+        dominant_joint = weights.argmax(axis=1)
+
+        hand_parts = self.token_encoder.mapper.hand_parts
+        part_name_to_id = {name: i for i, name in enumerate(hand_parts)}
+        joint_to_part_name = self.token_encoder.mapper.joint_to_part
+        default_part = part_name_to_id.get("PALM", len(hand_parts) - 1)
+
+        vert_to_part = np.empty(len(dominant_joint), dtype=np.int64)
+        for i, joint_id in enumerate(dominant_joint):
+            part_name = joint_to_part_name.get(int(joint_id), "PALM")
+            vert_to_part[i] = part_name_to_id.get(part_name, default_part)
+        return vert_to_part
+
+    def _load_obj_slot_data(self, obj_id: str):
+        if obj_id in self._slot_cache:
+            return self._slot_cache[obj_id]
+
+        npz_path = os.path.join(self.slot_dir, f"{obj_id}.npz")
+        if not os.path.exists(npz_path):
+            self._slot_cache[obj_id] = None
+            return None
+
+        with np.load(npz_path, allow_pickle=True) as data:
+            if "bps_slot_labels" not in data.files or "obj_scale" not in data.files:
+                self._slot_cache[obj_id] = None
+                return None
+
+            result = {
+                "bps_slot_labels": data["bps_slot_labels"].astype(np.int64),
+                "obj_scale": float(data["obj_scale"]),
+            }
+            self._slot_cache[obj_id] = result
+            return result
+
+    def propagate_slot_labels(self, obj_points: np.ndarray, obj_scale: float, bps_slot_labels: np.ndarray) -> np.ndarray:
+        basis_tree = cKDTree(self.bps_basis)
+        obj_norm = np.asarray(obj_points, dtype=np.float32) / max(float(obj_scale), 1e-6)
+        _, nearest_basis = basis_tree.query(obj_norm, k=1)
+        return np.asarray(bps_slot_labels, dtype=np.int64)[nearest_basis]
+
+    def recover_contact_matrix(
+        self,
+        hand_verts: np.ndarray,
+        obj_points: np.ndarray,
+        obj_slot_labels: np.ndarray,
+    ) -> np.ndarray:
+        tree = cKDTree(np.asarray(obj_points, dtype=np.float32))
+        dist, nearest_idx = tree.query(np.asarray(hand_verts, dtype=np.float32), k=1)
+        nearest_slots = np.asarray(obj_slot_labels, dtype=np.int64)[nearest_idx]
+
+        contact_matrix = np.full(
+            (self.num_hand_parts, self.num_slots),
+            -1,
+            dtype=np.int32,
+        )
+
+        contact_mask = (dist < self.contact_distance) & (nearest_slots >= 0)
+        for vid in np.flatnonzero(contact_mask):
+            part_id = int(self.vert_to_part[vid])
+            slot_id = int(nearest_slots[vid])
+            if 0 <= part_id < self.num_hand_parts and 0 <= slot_id < self.num_slots:
+                contact_matrix[part_id, slot_id] = 0
+
+        return contact_matrix
+
+    def compute_metrics(self, item: dict, hand_verts: np.ndarray, obj_points: np.ndarray):
+        tokens = np.asarray(item.get("tokens", np.array([])), dtype=np.int64)
+        if tokens.size == 0:
+            return None
+
+        slot_data = self._load_obj_slot_data(item["obj_id"])
+        if slot_data is None:
+            return None
+
+        gt_matrix = self.token_encoder.decode(tokens)
+        obj_slot_labels = self.propagate_slot_labels(
+            obj_points=np.asarray(obj_points, dtype=np.float32),
+            obj_scale=slot_data["obj_scale"],
+            bps_slot_labels=slot_data["bps_slot_labels"],
+        )
+        pred_matrix = self.recover_contact_matrix(
+            hand_verts=np.asarray(hand_verts, dtype=np.float32),
+            obj_points=np.asarray(obj_points, dtype=np.float32),
+            obj_slot_labels=obj_slot_labels,
+        )
+
+        return {
+            "contact_token_f1": compute_contact_token_f1(pred_matrix, gt_matrix),
+            "slot_hit_rate": compute_shr(pred_matrix, gt_matrix),
+        }
+
+
+# ==============================================================================
 # 数据加载
 # ==============================================================================
 
@@ -253,7 +417,7 @@ class GraspResultLoader:
 # 单样本评估
 # ==============================================================================
 
-def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh):
+def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper=None):
     """
     评估单个抓握: penetration + intersection + simulation
 
@@ -292,6 +456,22 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh):
     obj_wt_faces      = np.asarray(obj_wt.faces,          dtype=np.int32)
     obj_vox_points    = np.asarray(obj_vox.points,        dtype=np.float32)
     obj_element_volume = obj_vox.element_volume
+
+    semantic_metrics = {
+        "contact_token_f1": None,
+        "slot_hit_rate": None,
+    }
+    if semantic_helper is not None:
+        try:
+            semantic_result = semantic_helper.compute_metrics(
+                item=item,
+                hand_verts=hand_verts,
+                obj_points=obj_wt_verts,
+            )
+            if semantic_result is not None:
+                semantic_metrics.update(semantic_result)
+        except Exception as e:
+            logger.warning(f"  [{sample_id}] Semantic metrics unavailable: {e}")
 
     # ---- 穿透深度 ----
     try:
@@ -370,6 +550,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh):
         "sims_disp": float(sims_disp),
         "min_contact_dist": float(min_contact_dist),
         "near_contact": bool(min_contact_dist <= contact_thresh),
+        "contact_token_f1": semantic_metrics["contact_token_f1"],
+        "slot_hit_rate": semantic_metrics["slot_hit_rate"],
     }
 
 
@@ -388,10 +570,27 @@ def evaluate(args):
     n_total = len(loader)
     logger.info(f"Evaluating {n_total} grasps (n_jobs={args.n_jobs})...")
 
+    semantic_helper = None
+    try:
+        semantic_helper = SemanticMetricHelper(
+            config_path=args.config_path,
+            mano_assets_root=args.mano_assets_root,
+            bps_path=args.bps_path,
+            bps_slot_cache_dir=args.bps_slot_cache_dir,
+            split=args.split,
+            contact_distance=args.contact_thresh,
+        )
+        logger.info(
+            f"Semantic metrics enabled: split={args.split}, "
+            f"bps_slot_cache={os.path.join(args.bps_slot_cache_dir, args.split)}"
+        )
+    except Exception as e:
+        logger.warning(f"Semantic metrics disabled: {e}")
+
     # 近表面接触阈值（米）：
     # 以 hand vertex 到 object watertight surface 的最小距离定义接触。
     tasks = [
-        delayed(evaluate_single_grasp)(i, loader, sims_dir, args.contact_thresh)
+        delayed(evaluate_single_grasp)(i, loader, sims_dir, args.contact_thresh, semantic_helper)
         for i in range(n_total)
     ]
     raw_results = Parallel(n_jobs=args.n_jobs, verbose=10)(tasks)
@@ -411,6 +610,8 @@ def evaluate(args):
     sims_disp_list  = []
     min_contact_dist_meter = AverageMeter("min_contact_dist")
     contact_count   = 0
+    contact_token_f1_list = []
+    slot_hit_rate_list = []
 
     for r in valid:
         pentr_dep_meter.update(r["pentr_dep"])
@@ -420,6 +621,10 @@ def evaluate(args):
         min_contact_dist_meter.update(r["min_contact_dist"])
         if r["near_contact"]:
             contact_count += 1
+        if r.get("contact_token_f1") is not None:
+            contact_token_f1_list.append(float(r["contact_token_f1"]))
+        if r.get("slot_hit_rate") is not None:
+            slot_hit_rate_list.append(float(r["slot_hit_rate"]))
 
     n_valid        = len(valid)
     contact_ratio  = contact_count / n_valid if n_valid > 0 else 0.0
@@ -432,6 +637,12 @@ def evaluate(args):
     sims_disp_cm  = sims_disp_meter.avg * s
     sims_disp_std = float(np.std(sims_disp_list)) * s if sims_disp_list else 0.0
     min_contact_dist_mm = min_contact_dist_meter.avg * 1000.0
+    contact_token_f1 = (
+        float(np.mean(contact_token_f1_list)) if contact_token_f1_list else None
+    )
+    slot_hit_rate = (
+        float(np.mean(slot_hit_rate_list)) if slot_hit_rate_list else None
+    )
 
     # ---- 保存详细结果 ----
     with open(os.path.join(eval_dir, "eval_results.pkl"), "wb") as f:
@@ -451,6 +662,14 @@ def evaluate(args):
     print(f"  Sim Displacement (cm):   {sims_disp_cm:.6f} ± {sims_disp_std:.6f}")
     print(f"  Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}")
     print(f"  Min Surface Dist (mm):   {min_contact_dist_mm:.6f}")
+    if contact_token_f1 is not None:
+        print(f"  Contact Token F1:       {contact_token_f1:.4f}")
+    else:
+        print(f"  Contact Token F1:       N/A")
+    if slot_hit_rate is not None:
+        print(f"  Slot Hit Rate:          {slot_hit_rate:.4f}")
+    else:
+        print(f"  Slot Hit Rate:          N/A")
     print(f"{sep}")
 
     # ---- 保存文本报告 ----
@@ -465,6 +684,14 @@ def evaluate(args):
         f.write(f"Sim Displacement (std, cm):      {sims_disp_std:.6f}\n")
         f.write(f"Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}\n")
         f.write(f"Min Surface Dist (mean, mm):     {min_contact_dist_mm:.6f}\n")
+        if contact_token_f1 is not None:
+            f.write(f"Contact Token F1 (mean):         {contact_token_f1:.4f}\n")
+        else:
+            f.write("Contact Token F1 (mean):         N/A\n")
+        if slot_hit_rate is not None:
+            f.write(f"Slot Hit Rate (mean):            {slot_hit_rate:.4f}\n")
+        else:
+            f.write("Slot Hit Rate (mean):            N/A\n")
 
     logger.info(f"Results saved to: {eval_dir}")
 
@@ -483,7 +710,18 @@ if __name__ == "__main__":
     parser.add_argument("--n_jobs",   type=int, default=4)
     parser.add_argument("--contact_thresh", type=float, default=0.005,
                         help="Near-surface contact threshold in meters (default: 0.005 = 5mm)")
-    parser.add_argument("-g", "--gpu_id", type=str, default="0")
+    
+    parser.add_argument("--split", type=str, default="test",
+                        help="Split used to find BPS slot cache (default: test)")
+    parser.add_argument("--config_path", type=str, default="configs/token_config.yaml",
+                        help="Path to token config for decoding tokens")
+    parser.add_argument("--bps_path", type=str, default="configs/bps.npz",
+                        help="Path to BPS basis (.npz)")
+    parser.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
+                        help="Directory containing per-object BPS slot cache")
+    parser.add_argument("--mano_assets_root", type=str, default="assets/mano_v1_2",
+                        help="MANO assets root for building vertex-to-hand-part mapping")
+    parser.add_argument("-g", "--gpu_id", type=str, default="1")
     args = parser.parse_args()
 
     os.environ["OMP_NUM_THREADS"]    = "1"

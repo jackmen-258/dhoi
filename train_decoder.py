@@ -35,7 +35,6 @@ import chamfer_distance as chd
 from torch.utils.data import Dataset, DataLoader
 
 from data.token_encoder import TokenEncoder
-from models.clip_encoder import CLIPTextEncoder
 from models.condition_encoder import build_token_histogram
 from models.pose_decoder import (
     build_grab_model, ROT6D_POSE_DIM, TRANS_DIM, NUM_HAND_PARTS, NUM_SLOTS,
@@ -49,8 +48,6 @@ from utils.pose_utils import aa_to_rot6d, rot6d_to_aa
 
 COARSE_CKPT_PREFIXES = (
     "token_encoder",
-    "bps_set_encoder",
-    "bps_slot_predictor",
     "coarse_net",
 )
 REFINE_CKPT_PREFIXES = ("refine_net",)
@@ -221,9 +218,8 @@ class TrainConfig:
     vocab_size:   int = 26
     kl_coef:      float = 0.005
 
-    # ---- BPS basis / auxiliary slot supervision ----
+    # ---- BPS basis / slot supervision ----
     bps_slot_cache_dir:   str   = "cache/bps_slot"
-    bps_slot_predictor_weight: float = 1.0    # CE loss weight for BPSSlotPredictor
 
     # ---- RefineNet (joint training) ----
     refine_n_iters: int   = 3
@@ -234,7 +230,7 @@ class TrainConfig:
     refine_trans_noise_std: float = 0.01
 
     # ---- Part-Contact Consistency Loss ----
-    w_part_contact: float = 10.0
+    w_part_contact: float = 5.0
 
     # ---- training ----
     epochs:            int   = 100
@@ -246,16 +242,10 @@ class TrainConfig:
 
     # ---- ablation ----
     no_token_cond:      bool  = False   # zero out tok_summary for ablation
-    no_per_slot_feat:   bool  = False   # zero out slot_feat for ablation
-
-    # ---- text conditioning ----
-    use_text_cond:      bool  = True
-    text_feat_dim:      int   = 512
-    clip_model:         str   = "ViT-B/32"
 
     # ---- augmentation ----
-    token_drop_prob:    float = 0.15
-    token_sub_prob:     float = 0.05
+    token_drop_prob:    float = 0.0
+    token_sub_prob:     float = 0.005
     token_dropout_pivot: int = 6
     contact_thresh:     float = 0.005
 
@@ -311,11 +301,13 @@ class DecoderDataset(Dataset):
         intent:      str = "all",
         bps_path:    str = "configs/bps.npz",
         bps_slot_cache_dir: str = "",
+        require_bps_nn_points: bool = False,
     ):
         self.cache_dir = cache_dir
         self.encoder   = TokenEncoder(config_path)
         self.mapper    = self.encoder.mapper
         self.n_pc_points = n_pc_points
+        self.require_bps_nn_points = require_bps_nn_points
 
         with open(os.path.join(cache_dir, "dataset_index.json")) as f:
             index = json.load(f)
@@ -336,7 +328,6 @@ class DecoderDataset(Dataset):
             logging.warning(f"  Filtered {before - len(self.samples)} out-of-range samples")
 
         self._npz_cache = {}
-        self._text_cache = {}
 
         # ---- BPS slot cache: per-object npz files ----
         self._bps_slot_cache = {}
@@ -348,7 +339,7 @@ class DecoderDataset(Dataset):
                 self._bps_slot_dir = slot_dir
                 self._bps_has_nn_points = self._probe_bps_slot_cache_field("bps_nn_points")
                 logging.info(f"[DecoderDataset] BPS slot cache: {slot_dir}")
-                if not self._bps_has_nn_points:
+                if self.require_bps_nn_points and not self._bps_has_nn_points:
                     raise RuntimeError(
                         "[DecoderDataset] BPS slot cache does not contain bps_nn_points. "
                         "Run `python preprocess/build_bps_slot_cache.py` to regenerate the cache."
@@ -358,19 +349,6 @@ class DecoderDataset(Dataset):
                     f"BPS slot cache directory not found: {slot_dir}\n"
                     f"Run `python preprocess/build_bps_slot_cache.py` first."
                 )
-
-        text_cache_path = os.path.join(cache_dir, "text_cache.json")
-        if os.path.exists(text_cache_path):
-            with open(text_cache_path, "r", encoding="utf-8") as f:
-                self._text_cache = json.load(f)
-            logging.info(
-                f"[DecoderDataset] Text cache: {text_cache_path} ({len(self._text_cache)} prompts)"
-            )
-        else:
-            logging.warning(
-                f"[DecoderDataset] text_cache.json not found at {text_cache_path}; "
-                "decoder text conditioning will fall back to empty prompts."
-            )
 
         # Build obj_id index from OIShape grasp_list
         self._idx_to_obj_id = {}
@@ -454,7 +432,6 @@ class DecoderDataset(Dataset):
             "hand_shape":  torch.from_numpy(oi["hand_shape"]),
             "hand_tsl":    torch.from_numpy(oi["hand_tsl"]),
             "hand_verts":  torch.from_numpy(oi["hand_verts"]),
-            "text":        self._text_cache.get(entry["cache_file"], ""),
         }
 
         # BPS encoding from slot cache (required)
@@ -466,11 +443,16 @@ class DecoderDataset(Dataset):
             result["bps_slot_labels"] = torch.from_numpy(bps_slot_data["bps_slot_labels"])
             if self._bps_has_nn_points:
                 bps_nn_points = bps_slot_data["bps_nn_points"]
-                if bps_nn_points is None:
+                if self.require_bps_nn_points and bps_nn_points is None:
                     raise RuntimeError(
                         f"Mixed BPS slot cache formats detected for obj_id='{obj_id}'. "
                         "Please regenerate the full cache with "
                         "`python preprocess/build_bps_slot_cache.py`."
+                    )
+                if bps_nn_points is None:
+                    bps_nn_points = np.zeros(
+                        (bps_slot_data["bps_dists"].shape[0], 3),
+                        dtype=np.float32,
                     )
                 result["bps_nn_points"] = torch.from_numpy(bps_nn_points)
             result["obj_scale"] = torch.tensor(bps_slot_data["obj_scale"], dtype=torch.float32)
@@ -494,14 +476,7 @@ class DecoderDataset(Dataset):
 
 def _collate(batch):
     keys = list(batch[0].keys())
-    collated = {}
-    for k in keys:
-        values = [b[k] for b in batch]
-        if torch.is_tensor(values[0]):
-            collated[k] = torch.stack(values)
-        else:
-            collated[k] = values
-    return collated
+    return {k: torch.stack([b[k] for b in batch]) for k in keys}
 
 
 # ==============================================================================
@@ -546,11 +521,8 @@ class Trainer:
         self.mano = MANOHelper(
             mano_assets_root=cfg.mano_assets_root,
             device=str(self.device))
-        self.clip_enc = None
-        self._text_feat_cache = {}
 
         self._build_data()
-        self._build_text_conditioner()
         self._build_model()
         self._build_optimizer()
 
@@ -622,48 +594,18 @@ class Trainer:
             vocab_size=cfg.vocab_size,
             n_betas=cfg.n_betas,
             kl_coef=cfg.kl_coef,
-            text_feat_dim=cfg.text_feat_dim if cfg.use_text_cond else 0,
             refine_n_iters=cfg.refine_n_iters,
             refine_n_neurons=cfg.refine_n_neurons,
         ).to(self.device)
         if cfg.no_token_cond:
             self.model.no_token_cond = True
-        if cfg.no_per_slot_feat:
-            self.model.no_per_slot_feat = True
-
-    def _build_text_conditioner(self):
-        cfg = self.cfg
-        if not cfg.use_text_cond or cfg.text_feat_dim <= 0:
-            return
-        self.clip_enc = CLIPTextEncoder(cfg.clip_model, str(self.device))
-
-    @torch.no_grad()
-    def _encode_text_condition(self, texts) -> torch.Tensor | None:
-        if self.clip_enc is None or not self.cfg.use_text_cond or self.cfg.text_feat_dim <= 0:
-            return None
-
-        if texts is None:
-            return torch.zeros(0, self.cfg.text_feat_dim, device=self.device)
-
-        texts = [t if isinstance(t, str) else "" for t in texts]
-        if len(texts) == 0:
-            return torch.zeros(0, self.cfg.text_feat_dim, device=self.device)
-
-        missing = [t for t in dict.fromkeys(texts) if t not in self._text_feat_cache]
-        if missing:
-            encoded = self.clip_enc.encode_global(missing).detach().cpu()
-            for text, feat in zip(missing, encoded):
-                self._text_feat_cache[text] = feat
-
-        stacked = torch.stack([self._text_feat_cache[t] for t in texts], dim=0)
-        return stacked.to(self.device)
 
     def _build_optimizer(self):
         cfg = self.cfg
 
-        # CoarseNet + TokenEncoder + BPSSlotPredictor params (exclude refine_net)
+        # CoarseNet params only; RefineNet keeps its separate optimizer.
         coarse_params = [p for n, p in self.model.named_parameters()
-                         if not n.startswith("refine_net.")]
+                         if p.requires_grad and not n.startswith("refine_net.")]
         self.optimizer = torch.optim.Adam(
             coarse_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -749,18 +691,9 @@ class Trainer:
         self.logger.info(f"  Output:        rot6d={ROT6D_POSE_DIM} + trans={TRANS_DIM} (no shape)")
         self.logger.info(f"  Vocab size:    {cfg.vocab_size}")
         self.logger.info(f"  KL coef:       {cfg.kl_coef}")
-        self.logger.info(f"  BPS-slot w:    {cfg.bps_slot_predictor_weight}")
         self.logger.info(f"  Part-Contact w: {cfg.w_part_contact}")
         if cfg.no_token_cond:
             self.logger.info("  *** ABLATION: token conditioning DISABLED ***")
-        if cfg.no_per_slot_feat:
-            self.logger.info("  *** ABLATION: per-slot feature DISABLED ***")
-        if cfg.use_text_cond and cfg.text_feat_dim > 0:
-            self.logger.info(
-                f"  Decoder text:   enabled (CLIP {cfg.clip_model}, dim={cfg.text_feat_dim})"
-            )
-        else:
-            self.logger.info("  Decoder text:   disabled")
         self.logger.info("  LR schedule:   ReduceLROnPlateau per stage (GrabNet-style)")
         self.logger.info(
             f"  Token aug:     drop_p={cfg.token_drop_prob}  "
@@ -806,7 +739,6 @@ class Trainer:
         cfg = self.cfg
 
         bps_object = batch["bps_object"].to(self.device)
-        bps_nn_points = batch["bps_nn_points"].to(self.device)
         tokens     = batch["token_seq"].to(self.device)
         t_mask     = batch["token_mask"].to(self.device)
         gt_trans   = batch["hand_tsl"].to(self.device)
@@ -816,7 +748,6 @@ class Trainer:
         obj_vn     = batch["obj_vn"].to(self.device)
         bps_slot_labels = batch["bps_slot_labels"].to(self.device)
         obj_scale  = batch["obj_scale"].to(self.device)
-        text_feat = self._encode_text_condition(batch.get("text"))
 
         # ---- Augmentation ----
         if cfg.token_drop_prob > 0:
@@ -835,24 +766,11 @@ class Trainer:
 
         # ---- Token summary (semantic conditioning) ----
         tok_summary = self.model.encode_token_condition(tokens, t_mask)
-        slot_feat = self.model.encode_bps_condition(
-            bps_object, bps_nn_points, bps_slot_labels,
-        )
-
-        # ---- BPSSlotPredictor auxiliary loss ----
-        bps_slot_logits = self.model.bps_slot_predictor(
-            bps_object,
-            bps_nn_points=bps_nn_points,
-        )
-        loss_bps_slot_predictor = self.model.bps_slot_predictor.compute_loss(
-            bps_slot_logits, bps_slot_labels)
 
         # ---- CoarseNet forward ----
         drec = self.model.forward_coarse(
             bps_object,
             tok_summary,
-            slot_feat,
-            text_feat,
             gt_trans,
             gt_orient_rotmat,
         )
@@ -883,11 +801,6 @@ class Trainer:
             rh_faces, self.v_weights, self.v_weights2, B,
             obj_normals=obj_vn,
         )
-
-        # ---- BPSSlotPredictor loss ----
-        if cfg.bps_slot_predictor_weight > 0:
-            loss_total = loss_total + cfg.bps_slot_predictor_weight * loss_bps_slot_predictor
-            loss_dict["loss_bps_slot_predictor"] = loss_bps_slot_predictor
 
         # ---- Part-Contact Consistency Loss ----
         if cfg.w_part_contact > 0:
@@ -1009,7 +922,6 @@ class Trainer:
 
         for batch in self.val_dl:
             bps_object = batch["bps_object"].to(self.device)
-            bps_nn_points = batch["bps_nn_points"].to(self.device)
             tokens = batch["token_seq"].to(self.device)
             t_mask = batch["token_mask"].to(self.device)
             gt_trans = batch["hand_tsl"].to(self.device)
@@ -1018,7 +930,6 @@ class Trainer:
             obj_pc = batch["obj_pc"].to(self.device)
             obj_vn = batch["obj_vn"].to(self.device)
             obj_scale = batch["obj_scale"].to(self.device)
-            text_feat = self._encode_text_condition(batch.get("text"))
             B = gt_trans.shape[0]
             zeros_shape = torch.zeros(B, cfg.n_betas, device=self.device)
 
@@ -1032,27 +943,12 @@ class Trainer:
                     obj_pc, obj_scale, self.bps_basis, bps_slot_labels,
                 )
             tok_summary = self.model.encode_token_condition(tokens, t_mask)
-            slot_feat = self.model.encode_bps_condition(
-                bps_object, bps_nn_points, bps_slot_labels,
-            )
             drec = self.model.forward_coarse(
                 bps_object,
                 tok_summary,
-                slot_feat,
-                text_feat,
                 gt_trans,
                 gt_orient_rotmat,
             )
-
-            # BPSSlotPredictor accuracy
-            pred_labels = self.model.bps_slot_predictor.predict(
-                bps_object,
-                bps_nn_points=bps_nn_points,
-            )
-            valid_mask = bps_slot_labels >= 0
-            if valid_mask.any():
-                correct = (pred_labels[valid_mask] == bps_slot_labels[valid_mask]).float()
-                totals["bps_slot_predictor_acc"] += correct.mean().item() * B
 
             verts_pred, _ = self.mano(
                 drec["fullpose_aa"].float(),
@@ -1071,8 +967,6 @@ class Trainer:
             # Sample-based metrics
             pred = self.model.sample(
                 bps_object, tokens, t_mask,
-                bps_nn_points=bps_nn_points,
-                bps_slot_labels=bps_slot_labels,
             )
 
             pred_verts, _ = self.mano(
@@ -1224,10 +1118,6 @@ class Trainer:
         model_state, dropped = sanitize_posegrab_state_dict_for_load(
             raw_model_state, self.model.state_dict()
         )
-        if any(k.startswith("slot_grounder.") for k in raw_model_state):
-            self.logger.info(
-                "  Remapped legacy checkpoint keys: slot_grounder.* -> bps_slot_predictor.*"
-            )
         if dropped:
             self.logger.warning(
                 f"  Dropped {len(dropped)} incompatible checkpoint tensors during load"
@@ -1321,7 +1211,6 @@ class Trainer:
                 if self.global_step % cfg.log_every == 0:
                     parts = [f"  S{self.global_step:06d}"]
                     if self.fit_cnet and "loss_total" in log:
-                        bps_slot = f"  bps_slot={log.get('loss_bps_slot_predictor', 0):.4f}"
                         pc_loss = f"  pc={log.get('loss_part_contact', 0):.4f}" if cfg.w_part_contact > 0 else ""
                         parts.append(
                             f"coarse: total={log.get('loss_total', 0):.4f}  "
@@ -1330,7 +1219,7 @@ class Trainer:
                             f"dist_h={log.get('loss_dist_h', 0):.4f}  "
                             f"dist_o={log.get('loss_dist_o', 0):.4f}  "
                             f"edge={log.get('loss_edge', 0):.4f}"
-                            f"{bps_slot}{pc_loss}"
+                            f"{pc_loss}"
                         )
                     if self.fit_rnet and "rnet_refine_loss" in log:
                         parts.append(
@@ -1468,9 +1357,6 @@ def parse_args():
     # Slot supervision / part-contact auxiliaries
     p.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                    help="Directory for per-object BPS slot cache")
-    p.add_argument("--bps_slot_predictor_weight", "--slot_grounder_weight",
-                   dest="bps_slot_predictor_weight", type=float, default=1.0,
-                   help="Weight for BPS slot predictor CE loss")
 
     # RefineNet
     p.add_argument("--refine_n_iters", type=int, default=3)
@@ -1481,7 +1367,7 @@ def parse_args():
                    help="Std of Gaussian noise added to GT translation for RefineNet training")
 
     # Part-Contact Loss
-    p.add_argument("--w_part_contact", type=float, default=10.0,
+    p.add_argument("--w_part_contact", type=float, default=5.0,
                    help="Weight for Part-Contact Consistency Loss")
 
     p.add_argument("--epochs",       type=int,   default=200)
@@ -1489,11 +1375,9 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=5e-4)
     p.add_argument("--warmup_steps", type=int,   default=1000)
     p.add_argument("--resume",       type=str,   default="")
-    p.add_argument("--save_dir",     type=str,   default="checkpoints/decoder")
-    p.add_argument("--log_dir",      type=str,   default="logs/decoder")
+    p.add_argument("--save_dir",     type=str,   default="checkpoints/full/decoder")
+    p.add_argument("--log_dir",      type=str,   default="logs/full/decoder")
     p.add_argument("--seed",         type=int,   default=42)
-    p.add_argument("--clip_model",   type=str,   default="ViT-B/32")
-    p.add_argument("--text_feat_dim", type=int,  default=512)
     p.add_argument("--token_drop_prob", type=float, default=0.0)
     p.add_argument("--token_sub_prob",  type=float, default=0.005)
     p.add_argument("--token_dropout_pivot", type=int, default=6,
@@ -1503,10 +1387,6 @@ def parse_args():
     # Ablation
     p.add_argument("--no_token_cond", action="store_true",
                    help="Zero out token conditioning (ablation test)")
-    p.add_argument("--no_per_slot_feat", action="store_true",
-                   help="Zero out per-slot BPS features (ablation test)")
-    p.add_argument("--no_text_cond", action="store_true",
-                   help="Disable decoder-side global CLIP text conditioning")
 
     return p.parse_args()
 
@@ -1521,7 +1401,6 @@ def main():
         model_config=args.model_config,
         kl_coef=args.kl_coef,
         bps_slot_cache_dir=args.bps_slot_cache_dir,
-        bps_slot_predictor_weight=args.bps_slot_predictor_weight,
         refine_n_iters=args.refine_n_iters,
         refine_lr=args.refine_lr,
         refine_pose_noise_std=args.refine_pose_noise_std,
@@ -1535,15 +1414,11 @@ def main():
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         seed=args.seed,
-        use_text_cond=not args.no_text_cond,
-        text_feat_dim=args.text_feat_dim,
-        clip_model=args.clip_model,
         token_drop_prob=args.token_drop_prob,
         token_sub_prob=args.token_sub_prob,
         token_dropout_pivot=args.token_dropout_pivot,
         contact_thresh=args.contact_thresh,
         no_token_cond=args.no_token_cond,
-        no_per_slot_feat=args.no_per_slot_feat,
     )
     Trainer(cfg).train()
 

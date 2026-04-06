@@ -4,14 +4,13 @@ pose_decoder.py — BPS + Token Pose Decoder
 GrabNet-style CVAE (CoarseNet) with BPS + contact token conditioning.
 
 Architecture (following GrabNet Figure 7(2) intent conditioning):
-  TokenHistogramEncoder : tokens -> raw 24D histogram
-  CoarseNet CVAE        : [BPS(4096) | tok_hist(24)] -> rot6d(96) + trans(3)
+  TokenHistogramEncoder : tokens -> 24D histogram
+  CoarseNet CVAE        : [BPS(4096) | tok_cond(48)] -> rot6d(96) + trans(3)
 
 RefineNet is integrated as a sub-module of PoseGrabModel (joint-trained, see train_decoder.py).
 No shape prediction — uses mean hand shape (following GrabNet).
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,11 +31,20 @@ class PoseDecoderOutput:
     shape: torch.Tensor   # (B, 10) betas — zeros (mean shape)
 
 
+TOKEN_HIST_DIM = NUM_HAND_PARTS * NUM_SLOTS
+PART_TARGET_POS_DIM = NUM_HAND_PARTS * 3
+PART_TARGET_VALID_DIM = NUM_HAND_PARTS
+TOKEN_COND_DIM = TOKEN_HIST_DIM + PART_TARGET_POS_DIM + PART_TARGET_VALID_DIM
+GLOBAL_ORIENT_ROT6D_DIM = 6
+DISTAL_JOINT_PER_PART = [15, 3, 6, 12, 9, 0]
+
+
 def remap_legacy_posegrab_state_dict(state_dict: dict) -> dict:
     """Return checkpoint keys unchanged.
 
-    Legacy slot-grounder / per-slot-feature modules are no longer part of the
-    decoder architecture, so their weights are simply ignored during load.
+    Legacy slot-grounder / per-slot-feature modules and the removed PriorNet are
+    no longer part of the decoder architecture, so their weights are simply
+    ignored during load.
     """
     return dict(state_dict)
 
@@ -101,8 +109,8 @@ class CoarseNet(nn.Module):
     """CVAE for coarse pose generation.
 
     Follows GrabNet Figure 7(2) intent-conditioning pattern:
-      Encoder: [bps_raw(4096) | orient(9) | trans(3) | tok_hist(24)] → z(16)
-      Decoder: [z(16) | BN(bps_raw)(4096) | tok_hist(24)] → rot6d(96) + trans(3)
+      Encoder: [bps_raw(4096) | global_orient_rot6d(6) | trans(3) | tok_cond(48)] → z(16)
+      Decoder: [z(16) | BN(bps_raw)(4096) | tok_cond(48)] → rot6d(96) + trans(3)
     """
 
     def __init__(
@@ -110,8 +118,8 @@ class CoarseNet(nn.Module):
         n_neurons: int = 512,
         latentD: int = 16,
         in_bps: int = 4096,
-        in_pose: int = 12,
-        token_cond_dim: int = NUM_HAND_PARTS * NUM_SLOTS,
+        in_pose: int = GLOBAL_ORIENT_ROT6D_DIM + TRANS_DIM,
+        token_cond_dim: int = TOKEN_COND_DIM,
     ):
         super().__init__()
         self.latentD = latentD
@@ -119,7 +127,7 @@ class CoarseNet(nn.Module):
         self.in_pose = in_pose
         self.token_cond_dim = token_cond_dim
 
-        # ---- Encoder: bps_raw + GT pose + tok_hist → z ----
+        # ---- Encoder: bps_raw + GT global orient + trans + tok_cond → z ----
         # Independent BN per signal prevents 4096D BPS from dominating smaller conditions.
         enc_in = in_bps + in_pose + token_cond_dim
         self.enc_bn_bps = nn.BatchNorm1d(in_bps)
@@ -149,14 +157,15 @@ class CoarseNet(nn.Module):
     def encode(
         self,
         bps_raw: torch.Tensor,
+        gt_pose_rot6d: torch.Tensor,
         trans_rhand: torch.Tensor,
-        global_orient_rhand_rotmat: torch.Tensor,
         tok_summary: torch.Tensor,
     ) -> torch.distributions.Normal:
         """Encode GT into posterior q(z | x, o, tok)."""
         bs = bps_raw.shape[0]
+        global_orient_rot6d = gt_pose_rot6d[:, :GLOBAL_ORIENT_ROT6D_DIM]
         pose_in = torch.cat([
-            global_orient_rhand_rotmat.reshape(bs, -1),
+            global_orient_rot6d.reshape(bs, -1),
             trans_rhand,
         ], dim=1)
         X0 = torch.cat([
@@ -200,21 +209,21 @@ class CoarseNet(nn.Module):
     def forward(
         self,
         bps_raw: torch.Tensor,
+        gt_pose_rot6d: torch.Tensor,
         trans_rhand: torch.Tensor,
-        global_orient_rhand_rotmat: torch.Tensor,
         tok_summary: torch.Tensor,
         **kwargs,
     ) -> dict:
         """Training forward: encode GT → sample z → decode.
 
         Args:
-            bps_raw:                    (B, 4096) raw BPS distances
-            trans_rhand:                (B, 3) GT translation
-            global_orient_rhand_rotmat: (B, 9) GT global orient
-            tok_summary:                (B, token_cond_dim) raw token histogram
+            bps_raw:       (B, 4096) raw BPS distances
+            gt_pose_rot6d: (B, 96) GT full-hand pose in rot6d; encoder uses global orient only
+            trans_rhand:   (B, 3) GT translation
+            tok_summary:   (B, token_cond_dim) slot-aware token conditioning
         """
         z_dist = self.encode(
-            bps_raw, trans_rhand, global_orient_rhand_rotmat, tok_summary
+            bps_raw, gt_pose_rot6d, trans_rhand, tok_summary
         )
         z_s = z_dist.rsample()
         results = self.decode(z_s, bps_raw, tok_summary)
@@ -229,14 +238,45 @@ class CoarseNet(nn.Module):
         tok_summary: torch.Tensor,
         seed: int | None = None,
     ) -> dict:
-        """Sample from prior: z ~ N(0, I) → decode."""
+        """Sample from standard normal prior → decode."""
         bs = bps_raw.shape[0]
         device = bps_raw.device
         dtype = bps_raw.dtype
+
+        generator = None
         if seed is not None:
-            np.random.seed(seed)
-        z = torch.randn(bs, self.latentD, device=device, dtype=dtype)
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+        z = torch.randn(bs, self.latentD, device=device, dtype=dtype,
+                        generator=generator)
+
         return self.decode(z, bps_raw, tok_summary)
+
+    @torch.no_grad()
+    def sample_poses_iterative(
+        self,
+        bps_raw: torch.Tensor,
+        tok_summary: torch.Tensor,
+        n_refine: int = 2,
+        seed: int | None = None,
+    ) -> dict:
+        """Iterative posterior refinement at inference time.
+
+        Step 0: sample from prior → initial pose
+        Steps 1..n_refine: feed current pose into encoder → take z = q.mean → decode
+        """
+        results = self.sample_poses(bps_raw, tok_summary, seed=seed)
+        for _ in range(n_refine):
+            # Use current pose_rot6d as pseudo-GT for the encoder
+            q = self.encode(
+                bps_raw,
+                results["pose_rot6d"],
+                results["transl"],
+                tok_summary,
+            )
+            z = q.mean  # deterministic refinement
+            results = self.decode(z, bps_raw, tok_summary)
+        return results
 
 
 # ==============================================================================
@@ -257,6 +297,36 @@ def _parms_decode(pose_rot6d: torch.Tensor, trans: torch.Tensor) -> dict:
         "transl": trans,
         "fullpose_aa": pose_aa,
     }
+
+
+def _compute_slot_centroids_from_bps(
+    bps_slot_labels: torch.Tensor | None,
+    bps_nn_points: torch.Tensor | None,
+    num_slots: int = NUM_SLOTS,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Aggregate per-slot centroids from nearest normalized BPS points."""
+    if bps_slot_labels is None or bps_nn_points is None:
+        return None, None
+
+    labels = bps_slot_labels.long()
+    points = bps_nn_points.float()
+    valid = (labels >= 0) & (labels < num_slots)
+
+    labels_clamped = labels.clamp(min=0, max=num_slots - 1)
+    one_hot = F.one_hot(labels_clamped, num_classes=num_slots).float()
+    one_hot = one_hot * valid.unsqueeze(-1).float()
+
+    counts = one_hot.sum(dim=1)  # (B, S)
+    slot_sums = torch.einsum("bkc,bks->bsc", points, one_hot)
+    centroids = slot_sums / counts.unsqueeze(-1).clamp(min=1.0)
+    slot_valid = counts > 0
+
+    centroids = torch.where(
+        slot_valid.unsqueeze(-1),
+        centroids,
+        torch.zeros_like(centroids),
+    )
+    return centroids.to(dtype=bps_nn_points.dtype), slot_valid.float()
 
 
 # ==============================================================================
@@ -389,14 +459,14 @@ def compute_refine_loss(
         torch.einsum('ij,j->ij', torch.abs(h2o - h2o_gt), v_weights2))
 
     # ---- vertex reconstruction loss (GrabNet RefineNet: weight 20) ----
-    loss_mesh_rec = 20 * (1.0 - kl_coef) * torch.mean(
+    loss_mesh_rec = 35 * (1.0 - kl_coef) * torch.mean(
         torch.einsum('ijk,j->ijk', torch.abs(gt_verts - pred_verts), v_weights2))
 
     # ---- edge loss (GrabNet RefineNet: weight 10) ----
     if vpe is not None:
         edges_pred = pred_verts[:, vpe[:, 0]] - pred_verts[:, vpe[:, 1]]
         edges_gt = gt_verts[:, vpe[:, 0]] - gt_verts[:, vpe[:, 1]]
-        loss_edge = 10 * (1.0 - kl_coef) * F.l1_loss(edges_pred, edges_gt)
+        loss_edge = 30 * (1.0 - kl_coef) * F.l1_loss(edges_pred, edges_gt)
     else:
         loss_edge = torch.tensor(0.0, device=device)
 
@@ -433,7 +503,8 @@ class PoseGrabModel(nn.Module):
 
     Contains:
       - TokenHistogramEncoder : tokens → raw 24D histogram
-      - CoarseNet             : CVAE, [BPS ‖ tok_hist] → rot6d + trans
+      - Coarse condition      : tok_hist(24) + part_target_pos(18) + valid_mask(6)
+      - CoarseNet             : CVAE, [BPS ‖ tok_cond] → rot6d + trans
       - RefineNet             : iterative geometry-based refinement (h2o_dist → delta)
     """
 
@@ -442,7 +513,7 @@ class PoseGrabModel(nn.Module):
         vocab_size: int = 26,
         num_hand_parts: int = NUM_HAND_PARTS,
         num_slots: int = NUM_SLOTS,
-        token_embed_dim: int = NUM_HAND_PARTS * NUM_SLOTS,
+        token_embed_dim: int = TOKEN_COND_DIM,
         token_combo_dim: int | None = None,  # legacy config, ignored
         n_neurons: int = 512,
         latentD: int = 16,
@@ -454,16 +525,29 @@ class PoseGrabModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        del num_slots, token_combo_dim
+        del token_embed_dim, token_combo_dim
         kwargs.pop("slot_feat_dim", None)
         kwargs.pop("bps_set_hidden_dim", None)
         kwargs.pop("bps_slot_predictor_hidden", None)
         kwargs.pop("slot_grounder_hidden", None)
+        kwargs.pop("use_learned_prior", None)
+        kwargs.pop("prior_n_neurons", None)
 
+        self.num_hand_parts = num_hand_parts
+        self.num_slots = num_slots
+        self.token_hist_dim = num_hand_parts * num_slots
+        self.part_target_pos_dim = num_hand_parts * 3
+        self.part_target_valid_dim = num_hand_parts
+        self.token_cond_dim = (
+            self.token_hist_dim
+            + self.part_target_pos_dim
+            + self.part_target_valid_dim
+        )
         self.n_betas = n_betas
         self.kl_coef = kl_coef
         self.latentD = latentD
         self.no_token_cond = False   # ablation flag
+        self.no_part_target_pos = False  # ablation flag
 
         # Token → raw 24D histogram
         self.token_encoder = TokenHistogramEncoder(
@@ -476,7 +560,7 @@ class PoseGrabModel(nn.Module):
             n_neurons=n_neurons,
             latentD=latentD,
             in_bps=in_bps,
-            token_cond_dim=token_embed_dim,
+            token_cond_dim=self.token_cond_dim,
         )
 
         # RefineNet — iterative geometry-based refinement
@@ -493,34 +577,83 @@ class PoseGrabModel(nn.Module):
         self,
         tokens: torch.Tensor,
         token_mask: torch.Tensor,
+        bps_slot_labels: torch.Tensor | None = None,
+        bps_nn_points: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Build the interpretable token histogram condition."""
-        tok_summary = self.token_encoder(tokens, token_mask)
+        """Build slot-aware conditioning from tokens and slot geometry."""
+        tok_summary = self.token_encoder(tokens, token_mask)  # (B, 24)
+
+        B = tok_summary.shape[0]
+        slot_centroids, slot_valid = _compute_slot_centroids_from_bps(
+            bps_slot_labels,
+            bps_nn_points,
+            num_slots=self.num_slots,
+        )
+        if slot_centroids is None or slot_valid is None:
+            slot_centroids = torch.zeros(
+                B,
+                self.num_slots,
+                3,
+                device=tok_summary.device,
+                dtype=tok_summary.dtype,
+            )
+            slot_valid = torch.zeros(
+                B,
+                self.num_slots,
+                device=tok_summary.device,
+                dtype=tok_summary.dtype,
+            )
+        else:
+            slot_centroids = slot_centroids.to(device=tok_summary.device, dtype=tok_summary.dtype)
+            slot_valid = slot_valid.to(device=tok_summary.device, dtype=tok_summary.dtype)
+
+        tok_by_part = tok_summary.view(B, self.num_hand_parts, self.num_slots)
+        active_valid = tok_by_part * slot_valid.unsqueeze(1)
+        part_counts = active_valid.sum(dim=2, keepdim=True)  # (B, P, 1)
+        part_target_pos = torch.einsum("bps,bsc->bpc", active_valid, slot_centroids)
+        part_target_pos = part_target_pos / part_counts.clamp(min=1.0)
+        part_target_valid = (part_counts.squeeze(-1) > 0).float()
+        part_target_pos = torch.where(
+            part_target_valid.unsqueeze(-1).bool(),
+            part_target_pos,
+            torch.zeros_like(part_target_pos),
+        )
+        if self.no_part_target_pos:
+            part_target_pos = torch.zeros_like(part_target_pos)
+
+        cond = torch.cat(
+            [
+                tok_summary,
+                part_target_pos.reshape(B, -1),
+                part_target_valid,
+            ],
+            dim=1,
+        )
 
         if self.no_token_cond:
-            tok_summary = torch.zeros_like(tok_summary)
+            cond = torch.zeros_like(cond)
 
-        return tok_summary
+        return cond
 
     def forward_coarse(
         self,
         bps_raw: torch.Tensor,
         tok_summary: torch.Tensor,
+        gt_pose_rot6d: torch.Tensor,
         trans_rhand: torch.Tensor,
-        global_orient_rhand_rotmat: torch.Tensor,
     ) -> dict:
         """Training forward through CoarseNet.
 
         Args:
-            bps_raw:                    (B, 4096) raw BPS distances
-            tok_summary:                (B, token_embed_dim) raw token histogram
-            trans_rhand:                (B, 3) GT translation
-            global_orient_rhand_rotmat: (B, 9) GT global orient
+            bps_raw:       (B, 4096) raw BPS distances
+            tok_summary:   (B, token_embed_dim) raw token histogram
+            gt_pose_rot6d: (B, 96) GT full-hand pose in rot6d
+            trans_rhand:   (B, 3) GT translation
         """
         return self.coarse_net(
             bps_raw,
+            gt_pose_rot6d,
             trans_rhand,
-            global_orient_rhand_rotmat,
             tok_summary,
         )
 
@@ -610,8 +743,11 @@ class PoseGrabModel(nn.Module):
         bps_dists: torch.Tensor,
         tokens: torch.Tensor,
         mask: torch.Tensor,
+        bps_slot_labels: torch.Tensor | None = None,
+        bps_nn_points: torch.Tensor | None = None,
         n_betas: int | None = None,
         seed: int | None = None,
+        posterior_refine_steps: int = 0,
         **kwargs,
     ) -> PoseDecoderOutput:
         """Generate coarse pose from BPS + contact tokens (inference).
@@ -622,15 +758,28 @@ class PoseGrabModel(nn.Module):
             mask:      (B, L) token mask
             n_betas:   number of shape parameters (default: self.n_betas)
             seed:      random seed for CVAE prior sampling
+            posterior_refine_steps: if > 0, iteratively refine via encoder
         """
         del kwargs
         B = bps_dists.shape[0]
         nb = n_betas if n_betas is not None else self.n_betas
 
-        tok_summary = self.encode_token_condition(tokens, mask)
-        results = self.coarse_net.sample_poses(
-            bps_dists, tok_summary, seed=seed
+        tok_summary = self.encode_token_condition(
+            tokens,
+            mask,
+            bps_slot_labels=bps_slot_labels,
+            bps_nn_points=bps_nn_points,
         )
+
+        if posterior_refine_steps > 0:
+            results = self.coarse_net.sample_poses_iterative(
+                bps_dists, tok_summary,
+                n_refine=posterior_refine_steps, seed=seed,
+            )
+        else:
+            results = self.coarse_net.sample_poses(
+                bps_dists, tok_summary, seed=seed,
+            )
 
         pose_aa = results["fullpose_aa"]
         trans = results["transl"]
@@ -647,20 +796,27 @@ class PoseGrabModel(nn.Module):
         bps_dists: torch.Tensor,
         tokens: torch.Tensor,
         mask: torch.Tensor,
+        gt_pose_rot6d: torch.Tensor | None = None,
         trans_rhand: torch.Tensor | None = None,
-        global_orient_rhand_rotmat: torch.Tensor | None = None,
+        bps_slot_labels: torch.Tensor | None = None,
+        bps_nn_points: torch.Tensor | None = None,
         **kwargs,
     ):
         """Training forward: if GT is provided, run CVAE. Otherwise sample."""
         del kwargs
-        tok_summary = self.encode_token_condition(tokens, mask)
+        tok_summary = self.encode_token_condition(
+            tokens,
+            mask,
+            bps_slot_labels=bps_slot_labels,
+            bps_nn_points=bps_nn_points,
+        )
 
-        if trans_rhand is not None and global_orient_rhand_rotmat is not None:
+        if gt_pose_rot6d is not None and trans_rhand is not None:
             return self.forward_coarse(
                 bps_dists,
                 tok_summary,
+                gt_pose_rot6d,
                 trans_rhand,
-                global_orient_rhand_rotmat,
             )
         else:
             return self.coarse_net.sample_poses(
@@ -774,6 +930,31 @@ def build_vert_to_part(mano_fn) -> torch.Tensor:
     return jtp[dominant_joint]  # (778,)
 
 
+def build_part_contact_masks(mano_fn) -> torch.Tensor:
+    """Build per-part masks for the simplified part-contact loss.
+
+    Finger parts use only vertices whose dominant MANO joint is the distal joint,
+    which is our closest proxy for fingertip/distal supervision with the current
+    MANO assets. The palm part keeps wrist-dominant vertices so PALM tokens
+    retain a usable supervision region.
+
+    Returns:
+        (NUM_HAND_PARTS, 778) bool tensor
+    """
+    weights = mano_fn.mano.th_weights.detach().cpu()
+    dominant_joint = weights.argmax(dim=1)  # (778,)
+
+    masks = []
+    for part_id, joint_id in enumerate(DISTAL_JOINT_PER_PART):
+        if part_id == NUM_HAND_PARTS - 1:
+            mask = dominant_joint == 0
+        else:
+            mask = dominant_joint == joint_id
+        masks.append(mask)
+
+    return torch.stack(masks, dim=0)
+
+
 def propagate_slot_labels(
     obj_pc: torch.Tensor,           # (B, N, 3)
     obj_scale: torch.Tensor,        # (B,) normalization scale
@@ -809,38 +990,32 @@ def propagate_slot_labels(
     return labels
 
 
+
 def compute_part_contact_loss(
     hand_verts: torch.Tensor,       # (B, 778, 3)
     obj_pc: torch.Tensor,           # (B, N, 3)
     tokens: torch.Tensor,           # (B, L)
     token_mask: torch.Tensor,       # (B, L) bool
-    vert_to_part: torch.Tensor,     # (778,) long — vertex → part_id
+    part_vert_masks: torch.Tensor,  # (P, 778) bool — supervision vertices per part
     obj_slot_labels: torch.Tensor | None = None,  # (B, N) long — per-point slot labels
     num_slots: int = NUM_SLOTS,
+    contact_margin: float = 0.005,   # attraction deactivates within this distance
+    min_slot_points: int = 8,       # fall back to full object if fewer slot points
 ) -> torch.Tensor:
-    """Part-Contact Consistency Loss (ChamferDistance-based).
+    """Simplified part-contact loss: active part subset → target slot attraction.
 
-    For each contact token (part_id, slot_id):
-      - a contact patch within part_id should be close to the object
-      - If obj_slot_labels is provided: specifically close to slot_id region
+    Each active semantic token (part_id, slot_id) attracts a compact subset of
+    supervision vertices for that part toward the corresponding slot region.
+    There is no slot coverage term and no repulsion term for inactive parts.
 
-    Uses ChamferDistance CUDA kernel for nearest-neighbor lookup instead of
-    torch.cdist full pairwise matrix, reducing memory from O(n_sel*Vp*N) to
-    O(n_sel*Vp). Slot masking is achieved by replacing non-target points
-    with a far sentinel so ChamferDistance naturally ignores them. If a
-    slot has no propagated object points, that term is skipped instead of
-    falling back to the full object.
-
-    Returns:
-        scalar loss (0 if no valid tokens)
+    If the propagated slot region is too sparse, the loss falls back to the
+    full object point cloud to avoid pulling toward a noisy tiny cluster.
     """
     B, L = tokens.shape
-    V = hand_verts.shape[1]  # 778
-    N = obj_pc.shape[1]
     device = hand_verts.device
     n_semantic = NUM_HAND_PARTS * num_slots
 
-    vtp = vert_to_part.to(device)  # (V,)
+    part_masks = part_vert_masks.to(device=device, dtype=torch.bool)
 
     # Filter valid semantic tokens
     valid = token_mask & (tokens < n_semantic)  # (B, L)
@@ -852,16 +1027,13 @@ def compute_part_contact_loss(
     part_ids = torch.div(tok_clamped, num_slots, rounding_mode="floor")  # (B, L)
     slot_ids = tok_clamped % num_slots   # (B, L)
 
-    # Pre-compute per-part vertex masks: (NUM_HAND_PARTS, V)
-    part_masks = torch.stack([vtp == p for p in range(NUM_HAND_PARTS)])  # (P, V)
-
     # Collect all valid (b, part, slot) triples and deduplicate
     b_idx, l_idx = valid.nonzero(as_tuple=True)
     parts = part_ids[b_idx, l_idx]  # (K,)
     slots = slot_ids[b_idx, l_idx]  # (K,)
 
     keys = b_idx * (NUM_HAND_PARTS * num_slots) + parts * num_slots + slots
-    unique_keys, inv = keys.unique(return_inverse=True)
+    unique_keys = keys.unique()
     u_b = torch.div(
         unique_keys, NUM_HAND_PARTS * num_slots, rounding_mode="floor"
     )
@@ -875,65 +1047,66 @@ def compute_part_contact_loss(
     ch = chd.ChamferDistance()
     FAR = 1e6  # sentinel for masked-out object points
 
-    total_loss = hand_verts.new_zeros(())
-    valid_terms = 0
+    loss_attract = hand_verts.new_zeros(())
+    n_attract = 0
 
     for p in range(NUM_HAND_PARTS):
-        p_sel = (u_part == p)
-        if not p_sel.any():
-            continue
-
         pmask = part_masks[p]  # (V,) bool
         if not pmask.any():
             continue
 
-        sel_b = u_b[p_sel]       # batch indices for this part
-        sel_slot = u_slot[p_sel]  # slot ids for this part
+        # ---- Attraction: active (p, slot) pairs ----
+        p_sel = (u_part == p)
+        if p_sel.any():
+            sel_b = u_b[p_sel]       # batch indices for this part
+            sel_slot = u_slot[p_sel]  # slot ids for this part
+            pv = hand_verts[sel_b][:, pmask]  # (n_sel, Vp, 3)
 
-        # Gather part vertices: (n_sel, Vp, 3)
-        pv = hand_verts[sel_b][:, pmask]
+            if obj_slot_labels is not None:
+                sel_obj = obj_pc[sel_b]                # (n_sel, N, 3)
+                sel_labels = obj_slot_labels[sel_b]    # (n_sel, N)
+                slot_match = sel_labels == sel_slot.unsqueeze(1)  # (n_sel, N)
+                n_slot_pts = slot_match.sum(dim=1)     # (n_sel,)
 
-        if obj_slot_labels is not None:
-            sel_obj = obj_pc[sel_b]               # (n_sel, N, 3)
-            sel_labels = obj_slot_labels[sel_b]   # (n_sel, N)
+                # Split into reliable (enough slot points) and unreliable
+                reliable = n_slot_pts >= min_slot_points
 
-            # Mask non-target slot points with far sentinel
-            slot_match = sel_labels == sel_slot.unsqueeze(1)  # (n_sel, N)
-            has_slot_pts = slot_match.any(dim=1)               # (n_sel,)
-            if not has_slot_pts.any():
-                continue
+                # --- Reliable: slot-masked attraction ---
+                if reliable.any():
+                    pv_r = pv[reliable]
+                    obj_r = sel_obj[reliable].clone()
+                    match_r = slot_match[reliable]      # (n_r, N)
+                    obj_r.masked_fill_(~match_r.unsqueeze(-1), FAR)
 
-            pv = pv[has_slot_pts]
-            sel_obj = sel_obj[has_slot_pts].clone()
-            slot_match = slot_match[has_slot_pts]
-            sel_obj = sel_obj.masked_fill(~slot_match.unsqueeze(-1), FAR)
-        else:
-            sel_obj = obj_pc[sel_b]
+                    x_near, _, _, _ = ch(pv_r, obj_r)
 
-        # ChamferDistance: x_near = squared dist from each pv to nearest sel_obj
-        # Memory: O(n_sel * Vp) instead of O(n_sel * Vp * N)
-        x_near, _, _, _ = ch(pv, sel_obj)  # x_near: (n_sel, Vp)
-        min_dists = x_near.clamp_min(1e-12).sqrt()  # ChamferDistance returns squared distances
+                    # Attraction: part subset → target slot with a dead-zone margin.
+                    x_dists = (x_near + 1e-8).sqrt()    # (n_r, Vp)
+                    attract = torch.relu(x_dists - contact_margin)
+                    loss_attract = loss_attract + attract.mean(dim=1).sum()
+                    n_attract += pv_r.shape[0]
 
-        # Encourage a local contact patch instead of pulling the entire part.
-        contact_k = min(
-            min_dists.shape[1],
-            max(4, min(16, (min_dists.shape[1] + 3) // 4)),
-        )
-        patch_dists = torch.topk(
-            min_dists,
-            k=contact_k,
-            dim=1,
-            largest=False,
-        ).values
+                # --- Unreliable: fall back to full object (no slot masking) ---
+                unreliable = ~reliable
+                if unreliable.any():
+                    pv_u = pv[unreliable]
+                    obj_u = obj_pc[sel_b[unreliable]]
+                    x_near_u, _, _, _ = ch(pv_u, obj_u)
+                    x_dists_u = (x_near_u + 1e-8).sqrt()
+                    attract_u = torch.relu(x_dists_u - contact_margin)
+                    loss_attract = loss_attract + attract_u.mean(dim=1).sum()
+                    n_attract += pv_u.shape[0]
+            else:
+                sel_obj = obj_pc[sel_b]
+                x_near, _, _, _ = ch(pv, sel_obj)
+                x_dists = (x_near + 1e-8).sqrt()
+                attract = torch.relu(x_dists - contact_margin)
+                loss_attract = loss_attract + attract.mean(dim=1).sum()
+                n_attract += pv.shape[0]
 
-        total_loss = total_loss + patch_dists.mean(dim=1).sum()
-        valid_terms += patch_dists.shape[0]
-
-    if valid_terms == 0:
-        return hand_verts.new_zeros(())
-
-    return total_loss / valid_terms
+    if n_attract > 0:
+        return loss_attract / n_attract
+    return hand_verts.new_zeros(())
 
 
 # ==============================================================================
@@ -941,9 +1114,9 @@ def compute_part_contact_loss(
 # ==============================================================================
 
 _PRESETS = {
-    "small": dict(n_neurons=256, latentD=16, token_embed_dim=NUM_HAND_PARTS * NUM_SLOTS),
-    "base":  dict(n_neurons=512, latentD=16, token_embed_dim=NUM_HAND_PARTS * NUM_SLOTS),
-    "large": dict(n_neurons=768, latentD=32, token_embed_dim=NUM_HAND_PARTS * NUM_SLOTS),
+    "small": dict(n_neurons=256, latentD=16, token_embed_dim=TOKEN_COND_DIM),
+    "base":  dict(n_neurons=512, latentD=16, token_embed_dim=TOKEN_COND_DIM),
+    "large": dict(n_neurons=768, latentD=16, token_embed_dim=TOKEN_COND_DIM),
 }
 
 

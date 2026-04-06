@@ -159,10 +159,8 @@ def min_surface_distance(obj_mesh: trimesh.Trimesh, query_points: np.ndarray) ->
 # 语义指标
 # ==============================================================================
 
-def compute_contact_token_f1(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> float:
-    """
-    与 train_decoder.compute_token_recall_f1 等价的 F1（这里直接基于 contact_matrix 计算）。
-    """
+def compute_token_recall_f1(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> tuple[float, float]:
+    """Compute token recall/F1 directly from predicted vs GT contact matrices."""
     pred_hist = (np.asarray(pred_matrix) >= 0).reshape(-1).astype(np.float32)
     gt_hist = (np.asarray(gt_matrix) >= 0).reshape(-1).astype(np.float32)
 
@@ -175,16 +173,8 @@ def compute_contact_token_f1(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> 
 
     denom = precision + recall
     if denom <= 0:
-        return 0.0
-    return float(2.0 * precision * recall / denom)
-
-
-def compute_shr(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> float:
-    pred_slots = (pred_matrix >= 0).any(axis=0)   # (4,) bool
-    gt_slots   = (gt_matrix >= 0).any(axis=0)     # (4,) bool
-    if not gt_slots.any():
-        return 1.0
-    return float((pred_slots & gt_slots).sum()) / float(gt_slots.sum())
+        return float(recall), 0.0
+    return float(recall), float(2.0 * precision * recall / denom)
 
 
 class SemanticMetricHelper:
@@ -308,9 +298,10 @@ class SemanticMetricHelper:
             obj_slot_labels=obj_slot_labels,
         )
 
+        token_recall, token_f1 = compute_token_recall_f1(pred_matrix, gt_matrix)
         return {
-            "contact_token_f1": compute_contact_token_f1(pred_matrix, gt_matrix),
-            "slot_hit_rate": compute_shr(pred_matrix, gt_matrix),
+            "token_f1": token_f1,
+            "token_recall": token_recall,
         }
 
 
@@ -458,8 +449,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
     obj_element_volume = obj_vox.element_volume
 
     semantic_metrics = {
-        "contact_token_f1": None,
-        "slot_hit_rate": None,
+        "token_f1": None,
+        "token_recall": None,
     }
     if semantic_helper is not None:
         try:
@@ -550,8 +541,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
         "sims_disp": float(sims_disp),
         "min_contact_dist": float(min_contact_dist),
         "near_contact": bool(min_contact_dist <= contact_thresh),
-        "contact_token_f1": semantic_metrics["contact_token_f1"],
-        "slot_hit_rate": semantic_metrics["slot_hit_rate"],
+        "token_f1": semantic_metrics["token_f1"],
+        "token_recall": semantic_metrics["token_recall"],
     }
 
 
@@ -610,8 +601,8 @@ def evaluate(args):
     sims_disp_list  = []
     min_contact_dist_meter = AverageMeter("min_contact_dist")
     contact_count   = 0
-    contact_token_f1_list = []
-    slot_hit_rate_list = []
+    token_f1_list = []
+    token_recall_list = []
 
     for r in valid:
         pentr_dep_meter.update(r["pentr_dep"])
@@ -621,10 +612,10 @@ def evaluate(args):
         min_contact_dist_meter.update(r["min_contact_dist"])
         if r["near_contact"]:
             contact_count += 1
-        if r.get("contact_token_f1") is not None:
-            contact_token_f1_list.append(float(r["contact_token_f1"]))
-        if r.get("slot_hit_rate") is not None:
-            slot_hit_rate_list.append(float(r["slot_hit_rate"]))
+        if r.get("token_f1") is not None:
+            token_f1_list.append(float(r["token_f1"]))
+        if r.get("token_recall") is not None:
+            token_recall_list.append(float(r["token_recall"]))
 
     n_valid        = len(valid)
     contact_ratio  = contact_count / n_valid if n_valid > 0 else 0.0
@@ -637,11 +628,11 @@ def evaluate(args):
     sims_disp_cm  = sims_disp_meter.avg * s
     sims_disp_std = float(np.std(sims_disp_list)) * s if sims_disp_list else 0.0
     min_contact_dist_mm = min_contact_dist_meter.avg * 1000.0
-    contact_token_f1 = (
-        float(np.mean(contact_token_f1_list)) if contact_token_f1_list else None
+    token_f1 = (
+        float(np.mean(token_f1_list)) if token_f1_list else None
     )
-    slot_hit_rate = (
-        float(np.mean(slot_hit_rate_list)) if slot_hit_rate_list else None
+    token_recall = (
+        float(np.mean(token_recall_list)) if token_recall_list else None
     )
 
     # ---- 保存详细结果 ----
@@ -662,14 +653,14 @@ def evaluate(args):
     print(f"  Sim Displacement (cm):   {sims_disp_cm:.6f} ± {sims_disp_std:.6f}")
     print(f"  Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}")
     print(f"  Min Surface Dist (mm):   {min_contact_dist_mm:.6f}")
-    if contact_token_f1 is not None:
-        print(f"  Contact Token F1:       {contact_token_f1:.4f}")
+    if token_f1 is not None:
+        print(f"  Token F1:               {token_f1:.4f}")
     else:
-        print(f"  Contact Token F1:       N/A")
-    if slot_hit_rate is not None:
-        print(f"  Slot Hit Rate:          {slot_hit_rate:.4f}")
+        print(f"  Token F1:               N/A")
+    if token_recall is not None:
+        print(f"  Token Recall:           {token_recall:.4f}")
     else:
-        print(f"  Slot Hit Rate:          N/A")
+        print(f"  Token Recall:           N/A")
     print(f"{sep}")
 
     # ---- 保存文本报告 ----
@@ -684,14 +675,14 @@ def evaluate(args):
         f.write(f"Sim Displacement (std, cm):      {sims_disp_std:.6f}\n")
         f.write(f"Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}\n")
         f.write(f"Min Surface Dist (mean, mm):     {min_contact_dist_mm:.6f}\n")
-        if contact_token_f1 is not None:
-            f.write(f"Contact Token F1 (mean):         {contact_token_f1:.4f}\n")
+        if token_f1 is not None:
+            f.write(f"Token F1 (mean):                 {token_f1:.4f}\n")
         else:
-            f.write("Contact Token F1 (mean):         N/A\n")
-        if slot_hit_rate is not None:
-            f.write(f"Slot Hit Rate (mean):            {slot_hit_rate:.4f}\n")
+            f.write("Token F1 (mean):                 N/A\n")
+        if token_recall is not None:
+            f.write(f"Token Recall (mean):             {token_recall:.4f}\n")
         else:
-            f.write("Slot Hit Rate (mean):            N/A\n")
+            f.write("Token Recall (mean):             N/A\n")
 
     logger.info(f"Results saved to: {eval_dir}")
 

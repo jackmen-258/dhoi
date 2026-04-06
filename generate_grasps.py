@@ -154,8 +154,7 @@ def load_models(args, device):
     ).to(device)
 
     cnet_state = torch.load(args.decoder_cnet_ckpt, map_location=device)
-    rnet_state = torch.load(args.decoder_rnet_ckpt, map_location=device)
-    dec_cfg = cnet_state.get("config", {}) or rnet_state.get("config", {})
+    dec_cfg = cnet_state.get("config", {})
 
     decoder = build_grab_model(
         dec_cfg.get("model_config", args.decoder_config),
@@ -165,27 +164,40 @@ def load_models(args, device):
     if dec_cfg.get("no_token_cond", False):
         decoder.no_token_cond = True
         logger.info("  Decoder ablation from checkpoint: token conditioning DISABLED")
+    if dec_cfg.get("no_part_target_pos", False) or getattr(args, "no_part_target_pos", False):
+        decoder.no_part_target_pos = True
+        logger.info("  Decoder ablation: part_target_pos ZEROED")
+    if getattr(args, "posterior_refine_steps", 0) > 0:
+        logger.info(f"  Posterior refinement: {args.posterior_refine_steps} steps")
 
-    if cnet_state.get("config", {}) and rnet_state.get("config", {}):
-        cnet_model_cfg = cnet_state["config"].get("model_config")
-        rnet_model_cfg = rnet_state["config"].get("model_config")
-        if cnet_model_cfg != rnet_model_cfg:
-            logger.warning(
-                f"  Decoder config mismatch: best_cnet={cnet_model_cfg} "
-                f"best_rnet={rnet_model_cfg}"
-            )
     _load_decoder_stage(
         decoder, args.decoder_cnet_ckpt, device,
         only_prefixes=("token_encoder", "coarse_net"),
         stage_name="CoarseNet"
     )
-    _load_decoder_stage(
-        decoder, args.decoder_rnet_ckpt, device,
-        only_prefixes=("refine_net",),
-        stage_name="RefineNet"
-    )
-    has_refine = True
-    logger.info("  Decoder loaded from separate best_cnet.pt + best_rnet.pt ✓")
+    disable_refine = bool(dec_cfg.get("no_refine", False) or getattr(args, "no_refine", False))
+    has_refine = False
+    if disable_refine:
+        logger.info("  Decoder ablation: RefineNet DISABLED (coarse-only inference)")
+    elif args.decoder_rnet_ckpt and os.path.isfile(args.decoder_rnet_ckpt):
+        rnet_state = torch.load(args.decoder_rnet_ckpt, map_location=device)
+        if cnet_state.get("config", {}) and rnet_state.get("config", {}):
+            cnet_model_cfg = cnet_state["config"].get("model_config")
+            rnet_model_cfg = rnet_state["config"].get("model_config")
+            if cnet_model_cfg != rnet_model_cfg:
+                logger.warning(
+                    f"  Decoder config mismatch: best_cnet={cnet_model_cfg} "
+                    f"best_rnet={rnet_model_cfg}"
+                )
+        _load_decoder_stage(
+            decoder, args.decoder_rnet_ckpt, device,
+            only_prefixes=("refine_net",),
+            stage_name="RefineNet"
+        )
+        has_refine = True
+        logger.info("  Decoder loaded from separate best_cnet.pt + best_rnet.pt ✓")
+    else:
+        logger.warning("  decoder_rnet_ckpt not found; running coarse-only inference")
 
     # BPS basis for object encoding
     bps_path = dec_cfg.get("bps_path", args.bps_path)
@@ -325,7 +337,9 @@ def get_bps_slot_data(bps_slot_cache, obj_id, device):
 
 @torch.no_grad()
 def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
-                    bps_dists_cached=None):
+                    bps_dists_cached=None,
+                    bps_slot_labels_cached=None,
+                    bps_nn_points_cached=None):
     diffusion_obj_enc = models["diffusion_obj_enc"]
     denoiser = models["denoiser"]
     diffusion = models["diffusion"]
@@ -358,14 +372,22 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
     inferred_mask = tokens != models["pad_token_id"]
 
     # ---- Stage 2: CVAE decoder → coarse pose → RefineNet ----
-    if bps_dists_cached is not None:
-        # Use cached BPS distances from slot cache when available.
-        bps_object = bps_dists_cached
-    else:
-        bps_object, _ = _compute_bps(obj_pc, bps_basis)
+    bps_object = bps_dists_cached
+    bps_slot_labels = bps_slot_labels_cached
+    bps_nn_points = bps_nn_points_cached
+
+    if bps_object is None or bps_nn_points is None:
+        bps_object_online, bps_nn_points_online = _compute_bps(obj_pc, bps_basis)
+        if bps_object is None:
+            bps_object = bps_object_online
+        if bps_nn_points is None:
+            bps_nn_points = bps_nn_points_online
 
     pred = decoder.sample(
         bps_object, tokens, inferred_mask,
+        bps_slot_labels=bps_slot_labels,
+        bps_nn_points=bps_nn_points,
+        posterior_refine_steps=getattr(args, "posterior_refine_steps", 0),
     )
 
     final_pose = pred.pose
@@ -400,9 +422,9 @@ def generate_single(models, obj_pc, obj_vn, args, text_feat=None,
 def main():
     parser = argparse.ArgumentParser("Generate grasps (v18, diffusion + CVAE decoder + RefineNet)")
 
-    parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/full/diffusion/best.pt")
-    parser.add_argument("--decoder_cnet_ckpt", type=str, default="checkpoints/full/decoder/best_cnet.pt")
-    parser.add_argument("--decoder_rnet_ckpt", type=str, default="checkpoints/full/decoder/best_rnet.pt")
+    parser.add_argument("--diffusion_ckpt", type=str, default="checkpoints/wo_pc_loss/diffusion/best.pt")
+    parser.add_argument("--decoder_cnet_ckpt", type=str, default="checkpoints/wo_pc_loss/decoder/best_cnet.pt")
+    parser.add_argument("--decoder_rnet_ckpt", type=str, default="checkpoints/wo_pc_loss/decoder/best_rnet.pt")
 
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--oi_category", type=str, default="all")
@@ -438,9 +460,15 @@ def main():
     parser.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                         help="Per-object BPS slot cache directory")
 
-    parser.add_argument("--save_dir", type=str, default="experiments/generated")
+    parser.add_argument("--save_dir", type=str, default="experiments/ablation_full")
     parser.add_argument("--save_mesh", action="store_true")
 
+    parser.add_argument("--posterior_refine_steps", type=int, default=0,
+                        help="Iterative posterior refinement steps at inference (0=disabled)")
+    parser.add_argument("--no_refine", action="store_true",
+                        help="Disable RefineNet even if a refine checkpoint is provided")
+    parser.add_argument("--no_part_target_pos", action="store_true",
+                        help="Zero out slot-derived part_target_pos at inference")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -532,7 +560,7 @@ def main():
         obj_id = oi_sample.get("obj_id", f"obj_{si:05d}")
 
         # BPS slot cache lookup by obj_id
-        bps_dists_cached, _, _ = get_bps_slot_data(
+        bps_dists_cached, bps_slot_labels_cached, bps_nn_points_cached = get_bps_slot_data(
             bps_slot_cache, obj_id, device)
 
         if text_mode == "cache":
@@ -545,6 +573,8 @@ def main():
         hand_verts, hand_joints, mano_params, tokens = generate_single(
             models, obj_pc, obj_vn, args, text_feat=text_feat,
             bps_dists_cached=bps_dists_cached,
+            bps_slot_labels_cached=bps_slot_labels_cached,
+            bps_nn_points_cached=bps_nn_points_cached,
         )
 
         grasp_result = {

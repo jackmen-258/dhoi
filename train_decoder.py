@@ -30,20 +30,20 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import chamfer_distance as chd
 from torch.utils.data import Dataset, DataLoader
 
 from data.token_encoder import TokenEncoder
-from models.condition_encoder import build_token_histogram
+from models.condition_encoder import BPSSlotPredictor, build_token_histogram
 from models.pose_decoder import (
     build_grab_model, ROT6D_POSE_DIM, TRANS_DIM, NUM_HAND_PARTS, NUM_SLOTS,
     point2point_signed, compute_geo_loss,
-    build_vert_to_part, propagate_slot_labels, compute_part_contact_loss,
+    build_vert_to_part, build_part_contact_masks,
+    propagate_slot_labels, compute_part_contact_loss,
     RefineNet, compute_refine_loss, sanitize_posegrab_state_dict_for_load,
 )
 from utils.mano_utils import MANOHelper
-from utils.pose_utils import aa_to_rot6d, rot6d_to_aa
+from utils.pose_utils import aa_to_rot6d
 
 
 COARSE_CKPT_PREFIXES = (
@@ -51,6 +51,7 @@ COARSE_CKPT_PREFIXES = (
     "coarse_net",
 )
 REFINE_CKPT_PREFIXES = ("refine_net",)
+PREDICTOR_PREFIX = "bps_slot_predictor."
 
 
 # ==============================================================================
@@ -196,6 +197,16 @@ def _filter_state_dict_by_prefix(state_dict: Dict[str, torch.Tensor], prefixes):
     return {k: v for k, v in state_dict.items() if _matches_prefix(k, prefixes)}
 
 
+def _strip_predictor_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if any(key.startswith(PREDICTOR_PREFIX) for key in state_dict):
+        return {
+            key[len(PREDICTOR_PREFIX):]: value
+            for key, value in state_dict.items()
+            if key.startswith(PREDICTOR_PREFIX)
+        }
+    return state_dict
+
+
 # ==============================================================================
 # Config
 # ==============================================================================
@@ -220,6 +231,7 @@ class TrainConfig:
 
     # ---- BPS basis / slot supervision ----
     bps_slot_cache_dir:   str   = "cache/bps_slot"
+    predictor_ckpt:       str   = "checkpoints/predictor/best_predictor.pt"
 
     # ---- RefineNet (joint training) ----
     refine_n_iters: int   = 3
@@ -230,24 +242,26 @@ class TrainConfig:
     refine_trans_noise_std: float = 0.01
 
     # ---- Part-Contact Consistency Loss ----
-    w_part_contact: float = 5.0
+    w_part_contact: float = 10.0
 
     # ---- training ----
-    epochs:            int   = 100
+    epochs:            int   = 200
     batch_size:        int   = 128
     lr:                float = 5e-4    # GrabNet default: 5e-4
     weight_decay:      float = 5e-4   # GrabNet: reg_coef = 0.0005
-    warmup_steps:      int   = 1000
     max_grad_norm:     float = 0.0  # 0 = disabled (GrabNet does not clip gradients)
 
     # ---- ablation ----
     no_token_cond:      bool  = False   # zero out tok_summary for ablation
+    no_part_target_pos: bool  = False   # zero slot-position term, keep token hist + valid mask
+    no_refine:          bool  = False   # disable RefineNet training/validation
 
     # ---- augmentation ----
     token_drop_prob:    float = 0.0
     token_sub_prob:     float = 0.005
     token_dropout_pivot: int = 6
     contact_thresh:     float = 0.005
+    token_eval_seed_base: int = 12345
 
     # ---- logging / save ----
     log_dir:    str = "logs/decoder"
@@ -256,7 +270,7 @@ class TrainConfig:
     val_every:  int = 1000
     save_every: int = 5000
     save_top_k: int = 5
-    early_stop_patience: int = 10
+    early_stop_patience: int = 30
 
     # ---- resume ----
     resume: str = ""
@@ -512,7 +526,8 @@ class Trainer:
         self.no_improve_cnet = 0
         self.no_improve_rnet = 0
         self.fit_cnet = True
-        self.fit_rnet = True
+        self.fit_rnet = not cfg.no_refine
+        self.current_kl_coef = 0.0
 
         self._set_seed(cfg.seed)
         os.makedirs(cfg.save_dir, exist_ok=True)
@@ -528,6 +543,8 @@ class Trainer:
 
         if cfg.resume and os.path.isfile(cfg.resume):
             self._load_checkpoint(cfg.resume)
+
+        self._apply_current_kl_coef()
 
         # Load vertex weights and edge pairs for GrabNet-style loss
         self._load_loss_assets()
@@ -561,12 +578,14 @@ class Trainer:
 
     def _build_data(self):
         cfg = self.cfg
+        require_bps_nn_points = True
         self.train_ds = DecoderDataset(
             cfg.cache_dir, cfg.config_path, "train",
             n_pc_points=cfg.n_pc_points,
             category=cfg.oi_category, intent=cfg.oi_intent,
             bps_path=cfg.bps_path,
-            bps_slot_cache_dir=cfg.bps_slot_cache_dir)
+            bps_slot_cache_dir=cfg.bps_slot_cache_dir,
+            require_bps_nn_points=require_bps_nn_points)
 
         self.train_dl = DataLoader(
             self.train_ds, batch_size=cfg.batch_size,
@@ -581,7 +600,8 @@ class Trainer:
                 n_pc_points=cfg.n_pc_points,
                 category=cfg.oi_category, intent=cfg.oi_intent,
                 bps_path=cfg.bps_path,
-                bps_slot_cache_dir=cfg.bps_slot_cache_dir)
+                bps_slot_cache_dir=cfg.bps_slot_cache_dir,
+                require_bps_nn_points=require_bps_nn_points)
             self.val_dl = DataLoader(
                 val_ds, batch_size=cfg.batch_size, shuffle=False,
                 num_workers=cfg.num_workers, pin_memory=True,
@@ -599,6 +619,102 @@ class Trainer:
         ).to(self.device)
         if cfg.no_token_cond:
             self.model.no_token_cond = True
+        if cfg.no_part_target_pos:
+            self.model.no_part_target_pos = True
+        self.slot_predictor = None
+        self.predictor_ckpt_path = None
+        self.slot_label_source = "gt"
+        if cfg.predictor_ckpt:
+            self._build_slot_predictor(cfg.predictor_ckpt)
+            self.slot_label_source = "predictor"
+
+    def _build_slot_predictor(self, ckpt_path: str):
+        cfg = self.cfg
+        resolved_ckpt = ckpt_path
+        if not os.path.isfile(resolved_ckpt):
+            fallback_candidates = [
+                ckpt_path.replace(
+                    "checkpoints/predictor/",
+                    "checkpoints/full/predictor/",
+                ),
+                ckpt_path.replace(
+                    "checkpoints/full/predictor/",
+                    "checkpoints/predictor/",
+                ),
+            ]
+            for candidate in fallback_candidates:
+                if candidate != resolved_ckpt and os.path.isfile(candidate):
+                    resolved_ckpt = candidate
+                    break
+        if not os.path.isfile(resolved_ckpt):
+            raise FileNotFoundError(
+                f"Predictor checkpoint not found: {ckpt_path}\n"
+                "Train it first with `python dhoi/train_predictor.py`."
+            )
+        if resolved_ckpt != ckpt_path:
+            self.logger.warning(
+                f"Predictor checkpoint not found at {ckpt_path}; using {resolved_ckpt} instead."
+            )
+        self.predictor_ckpt_path = resolved_ckpt
+
+        ckpt = torch.load(resolved_ckpt, map_location=self.device)
+        raw_state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        predictor_state = _strip_predictor_prefix(raw_state)
+        predictor_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+
+        bps_data = np.load(cfg.bps_path)
+        basis = bps_data["basis"].astype(np.float32)
+        if basis.ndim == 3:
+            basis = basis.squeeze(0)
+
+        self.slot_predictor = BPSSlotPredictor(
+            hidden_dim=int(predictor_cfg.get("hidden_dim", 256)),
+            basis_points=basis,
+            num_neighbors=int(predictor_cfg.get("num_neighbors", 16)),
+            num_layers=int(predictor_cfg.get("num_layers", 2)),
+            dropout=float(predictor_cfg.get("dropout", 0.0)),
+            chunk_size=int(predictor_cfg.get("chunk_size", 256)),
+        ).to(self.device)
+        missing, unexpected = self.slot_predictor.load_state_dict(predictor_state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Predictor checkpoint is incompatible with current BPSSlotPredictor "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})."
+            )
+        self.slot_predictor.eval()
+        for param in self.slot_predictor.parameters():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def _predict_bps_slot_labels(
+        self,
+        bps_object: torch.Tensor,
+        bps_nn_points: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.slot_predictor is None:
+            raise RuntimeError("slot predictor is not initialized")
+        return self.slot_predictor.predict(
+            bps_object,
+            bps_nn_points=bps_nn_points,
+        )
+
+    @torch.no_grad()
+    def _build_obj_slot_labels(
+        self,
+        obj_pc: torch.Tensor,
+        obj_scale: torch.Tensor,
+        bps_object: torch.Tensor,
+        bps_nn_points: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.bps_basis is None:
+            return None
+        bps_slot_labels = self._predict_bps_slot_labels(bps_object, bps_nn_points)
+        return propagate_slot_labels(
+            obj_pc,
+            obj_scale,
+            self.bps_basis,
+            bps_slot_labels,
+        )
 
     def _build_optimizer(self):
         cfg = self.cfg
@@ -613,12 +729,34 @@ class Trainer:
         )
 
         # RefineNet optimizer (separate, following GrabNet)
-        self.optimizer_refine = torch.optim.Adam(
-            self.model.refine_net.parameters(), lr=cfg.refine_lr,
-            weight_decay=cfg.weight_decay)
-        self.scheduler_refine = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer_refine, mode="min"
-        )
+        if cfg.no_refine:
+            self.optimizer_refine = None
+            self.scheduler_refine = None
+        else:
+            self.optimizer_refine = torch.optim.Adam(
+                self.model.refine_net.parameters(), lr=cfg.refine_lr,
+                weight_decay=cfg.weight_decay)
+            self.scheduler_refine = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer_refine, mode="min"
+            )
+
+    def _compute_current_kl_coef(self, epoch: float | None = None) -> float:
+        del epoch
+        return float(self.cfg.kl_coef)
+
+    def _apply_current_kl_coef(self, epoch: float | None = None) -> float:
+        current_kl = self._compute_current_kl_coef(epoch)
+        self.model.kl_coef = current_kl
+        self.current_kl_coef = current_kl
+        return current_kl
+
+    def _coarse_patience_start_epoch(self) -> float:
+        return 0.0
+
+    def _is_coarse_patience_active(self, epoch: float | None = None) -> bool:
+        if epoch is None:
+            epoch = float(self.epoch)
+        return float(epoch) >= self._coarse_patience_start_epoch()
 
     def _load_loss_assets(self):
         """Load vertex weights and edge pairs for GrabNet-style loss."""
@@ -666,12 +804,17 @@ class Trainer:
     def _setup_part_contact(self):
         """Setup Part-Contact Consistency Loss."""
         self.vert_to_part = build_vert_to_part(self.mano).to(self.device)
+        self.pc_part_masks = build_part_contact_masks(self.mano).to(self.device)
         self.logger.info(f"[Part-Contact] Built vertex→part mapping (778 → {NUM_HAND_PARTS} parts)")
 
-        # Log per-part vertex counts
+        # Log full-part counts and the compact distal/palm supervision subsets.
+        part_names = ["THUMB", "INDEX", "MIDDLE", "RING", "LITTLE", "PALM"]
         for p in range(NUM_HAND_PARTS):
             cnt = (self.vert_to_part == p).sum().item()
-            part_names = ["THUMB", "INDEX", "MIDDLE", "RING", "LITTLE", "PALM"]
+            self.logger.info(f"  {part_names[p]}: {cnt} vertices")
+        self.logger.info("[Part-Contact] Supervision subset (distal fingers + palm)")
+        for p in range(NUM_HAND_PARTS):
+            cnt = self.pc_part_masks[p].sum().item()
             self.logger.info(f"  {part_names[p]}: {cnt} vertices")
 
     def _log_info(self):
@@ -689,20 +832,36 @@ class Trainer:
         )
 
         self.logger.info(f"  Output:        rot6d={ROT6D_POSE_DIM} + trans={TRANS_DIM} (no shape)")
+        self.logger.info(f"  Latent z:      {self.model.latentD}")
+        self.logger.info("  Posterior GT:  global orient rot6d + translation")
         self.logger.info(f"  Vocab size:    {cfg.vocab_size}")
-        self.logger.info(f"  KL coef:       {cfg.kl_coef}")
+        self.logger.info(f"  KL coef:       fixed {cfg.kl_coef}")
         self.logger.info(f"  Part-Contact w: {cfg.w_part_contact}")
+        self.logger.info(f"  Slot labels:   {self.slot_label_source}")
+        if self.slot_predictor is not None:
+            self.logger.info(f"  Predictor ckpt:{getattr(self, 'predictor_ckpt_path', cfg.predictor_ckpt)}")
+        self.logger.info(
+            f"  Token eval:    single fixed prior seed ({cfg.token_eval_seed_base})"
+        )
         if cfg.no_token_cond:
             self.logger.info("  *** ABLATION: token conditioning DISABLED ***")
+        if cfg.no_part_target_pos:
+            self.logger.info("  *** ABLATION: part_target_pos ZEROED (valid_mask kept) ***")
+        if cfg.no_refine:
+            self.logger.info("  *** ABLATION: RefineNet DISABLED ***")
         self.logger.info("  LR schedule:   ReduceLROnPlateau per stage (GrabNet-style)")
         self.logger.info(
             f"  Token aug:     drop_p={cfg.token_drop_prob}  "
             f"sub_p={cfg.token_sub_prob}  pivot={cfg.token_dropout_pivot}"
         )
-        self.logger.info(
-            "  Best ckpt:     save stage-only best_cnet.pt / best_rnet.pt by val total loss "
-            "(latest/final keep full training snapshots; coarse token metrics are monitor-only)"
-        )
+        if cfg.no_refine:
+            self.logger.info("  Best ckpt:     save best_cnet.pt by val coarse loss")
+        else:
+            self.logger.info(
+                "  Best ckpt:     save best_cnet.pt by val coarse loss, "
+                "and best_rnet.pt by val refine loss"
+            )
+        self.logger.info("  Coarse ES:     track val coarse total_loss, active immediately (fixed KL)")
         self.logger.info(f"  Train:         {len(self.train_ds)} samples, "
                          f"{len(self.train_dl)} steps/epoch")
         self.logger.info("=" * 60)
@@ -737,16 +896,18 @@ class Trainer:
 
     def _train_step_coarse(self, batch) -> Dict[str, float]:
         cfg = self.cfg
+        current_kl = self.current_kl_coef
 
         bps_object = batch["bps_object"].to(self.device)
+        bps_slot_labels = batch["bps_slot_labels"].to(self.device)
+        bps_nn_points = batch["bps_nn_points"].to(self.device)
         tokens     = batch["token_seq"].to(self.device)
         t_mask     = batch["token_mask"].to(self.device)
         gt_trans   = batch["hand_tsl"].to(self.device)
-        gt_orient_rotmat = batch["global_orient_rhand_rotmat"].to(self.device)
         gt_pose    = batch["hand_pose"].to(self.device)
+        gt_pose_rot6d = aa_to_rot6d(gt_pose)
         obj_pc     = batch["obj_pc"].to(self.device)
         obj_vn     = batch["obj_vn"].to(self.device)
-        bps_slot_labels = batch["bps_slot_labels"].to(self.device)
         obj_scale  = batch["obj_scale"].to(self.device)
 
         # ---- Augmentation ----
@@ -765,14 +926,19 @@ class Trainer:
         self.optimizer.zero_grad()
 
         # ---- Token summary (semantic conditioning) ----
-        tok_summary = self.model.encode_token_condition(tokens, t_mask)
+        tok_summary = self.model.encode_token_condition(
+            tokens,
+            t_mask,
+            bps_slot_labels=bps_slot_labels,
+            bps_nn_points=bps_nn_points,
+        )
 
         # ---- CoarseNet forward ----
         drec = self.model.forward_coarse(
             bps_object,
             tok_summary,
+            gt_pose_rot6d,
             gt_trans,
-            gt_orient_rotmat,
         )
 
         # ---- MANO forward: both pred and GT use mean shape (zeros) ----
@@ -804,24 +970,26 @@ class Trainer:
 
         # ---- Part-Contact Consistency Loss ----
         if cfg.w_part_contact > 0:
-            # Propagate slot labels to object surface points
-            obj_slot_labels = None
-            if self.bps_basis is not None:
-                obj_slot_labels = propagate_slot_labels(
-                    obj_pc, obj_scale, self.bps_basis, bps_slot_labels)
+            obj_slot_labels = self._build_obj_slot_labels(
+                obj_pc,
+                obj_scale,
+                bps_object,
+                bps_nn_points,
+            )
 
             loss_pc = compute_part_contact_loss(
                 hand_verts=verts_pred,
                 obj_pc=obj_pc,
                 tokens=tokens,
                 token_mask=t_mask,
-                vert_to_part=self.vert_to_part,
+                part_vert_masks=self.pc_part_masks,
                 obj_slot_labels=obj_slot_labels,
             )
             loss_total = loss_total + cfg.w_part_contact * loss_pc
             loss_dict["loss_part_contact"] = loss_pc
 
         loss_dict["loss_total"] = loss_total
+        loss_dict["kl_coef_cur"] = float(current_kl)
 
         metrics = {k: v.item() if isinstance(v, torch.Tensor) else v
                    for k, v in loss_dict.items()}
@@ -875,7 +1043,7 @@ class Trainer:
             v_weights=self.v_weights,
             v_weights2=self.v_weights2,
             vpe=self.vpe,
-            kl_coef=cfg.kl_coef,
+            kl_coef=self.current_kl_coef,
             h2o_gt=h2o_gt,
             obj_normals=obj_vn,
         )
@@ -893,6 +1061,7 @@ class Trainer:
 
     def _train_step(self, batch) -> Dict[str, float]:
         """Joint training step: CoarseNet + RefineNet."""
+        self._apply_current_kl_coef()
         coarse_metrics = {}
         if self.fit_cnet:
             coarse_metrics = self._train_step_coarse(batch)
@@ -913,20 +1082,24 @@ class Trainer:
         if self.val_dl is None:
             return {}
         cfg = self.cfg
+        current_kl = self._apply_current_kl_coef()
         self.model.eval()
         if self.fit_rnet:
             self.model.refine_net.eval()
         totals = defaultdict(float)
         n = 0
         token_metric_samples = 0
+        token_eval_seed = int(cfg.token_eval_seed_base)
 
         for batch in self.val_dl:
             bps_object = batch["bps_object"].to(self.device)
+            bps_slot_labels = batch["bps_slot_labels"].to(self.device)
+            bps_nn_points = batch["bps_nn_points"].to(self.device)
             tokens = batch["token_seq"].to(self.device)
             t_mask = batch["token_mask"].to(self.device)
             gt_trans = batch["hand_tsl"].to(self.device)
             gt_pose = batch["hand_pose"].to(self.device)
-            gt_orient_rotmat = batch["global_orient_rhand_rotmat"].to(self.device)
+            gt_pose_rot6d = aa_to_rot6d(gt_pose)
             obj_pc = batch["obj_pc"].to(self.device)
             obj_vn = batch["obj_vn"].to(self.device)
             obj_scale = batch["obj_scale"].to(self.device)
@@ -936,18 +1109,23 @@ class Trainer:
             # Recompute GT verts with mean shape
             gt_verts, _ = self.mano(gt_pose, gt_trans, zeros_shape)
 
-            bps_slot_labels = batch["bps_slot_labels"].to(self.device)
-            obj_slot_labels = None
-            if self.bps_basis is not None:
-                obj_slot_labels = propagate_slot_labels(
-                    obj_pc, obj_scale, self.bps_basis, bps_slot_labels,
-                )
-            tok_summary = self.model.encode_token_condition(tokens, t_mask)
+            obj_slot_labels = self._build_obj_slot_labels(
+                obj_pc,
+                obj_scale,
+                bps_object,
+                bps_nn_points,
+            )
+            tok_summary = self.model.encode_token_condition(
+                tokens,
+                t_mask,
+                bps_slot_labels=bps_slot_labels,
+                bps_nn_points=bps_nn_points,
+            )
             drec = self.model.forward_coarse(
                 bps_object,
                 tok_summary,
+                gt_pose_rot6d,
                 gt_trans,
-                gt_orient_rotmat,
             )
 
             verts_pred, _ = self.mano(
@@ -964,9 +1142,12 @@ class Trainer:
                 obj_normals=obj_vn,
             )
 
-            # Sample-based metrics
+            # Sample-based metrics use a single fixed prior seed for determinism.
             pred = self.model.sample(
                 bps_object, tokens, t_mask,
+                bps_slot_labels=bps_slot_labels,
+                bps_nn_points=bps_nn_points,
+                seed=token_eval_seed,
             )
 
             pred_verts, _ = self.mano(
@@ -999,7 +1180,7 @@ class Trainer:
                     v_weights=self.v_weights,
                     v_weights2=self.v_weights2,
                     vpe=self.vpe,
-                    kl_coef=cfg.kl_coef,
+                    kl_coef=current_kl,
                     obj_normals=obj_vn,
                 )
                 totals["rnet_loss_total"] += rnet_loss.item() * B
@@ -1022,7 +1203,7 @@ class Trainer:
             if token_eval_mask is not None and token_eval_mask.any():
                 eval_B = int(token_eval_mask.sum().item())
 
-                def _tok_f1(verts_eval):
+                def _tok_metrics(verts_eval):
                     cm = recover_contact_matrix_from_obj_slots(
                         verts_eval[token_eval_mask],
                         obj_pc[token_eval_mask],
@@ -1035,10 +1216,9 @@ class Trainer:
                         cm, tokens[token_eval_mask], t_mask[token_eval_mask]
                     )
 
-                # Coarse token_f1 (before RefineNet) — diagnostic
-                coarse_recall, coarse_f1 = _tok_f1(pred_verts)
-                totals["token_recall"] += coarse_recall.mean().item() * eval_B
-                totals["token_f1"] += coarse_f1.mean().item() * eval_B
+                recall, f1 = _tok_metrics(pred_verts)
+                totals["token_recall"] += recall.mean().item() * eval_B
+                totals["token_f1"] += f1.mean().item() * eval_B
 
                 token_metric_samples += eval_B
             else:
@@ -1055,7 +1235,10 @@ class Trainer:
         self.model.train()
         if self.fit_rnet:
             self.model.refine_net.train()
-        _token_keys = {"token_recall", "token_f1"}
+        _token_keys = {
+            "token_recall",
+            "token_f1"
+        }
         metrics = {}
         for k, v in totals.items():
             if k in _token_keys:
@@ -1063,6 +1246,7 @@ class Trainer:
             else:
                 metrics[f"val/{k}"] = v / max(n, 1)
         metrics["val/token_eval_samples"] = float(token_metric_samples)
+        metrics["val/kl_coef"] = float(current_kl)
         return metrics
 
     # ================================================================
@@ -1097,12 +1281,16 @@ class Trainer:
             save_dict["optimizer"] = self.optimizer.state_dict()
             save_dict["scheduler"] = self.scheduler.state_dict() if self.scheduler is not None else None
         if stage_name == "full":
-            save_dict["optimizer_refine"] = self.optimizer_refine.state_dict()
+            save_dict["optimizer_refine"] = (
+                self.optimizer_refine.state_dict() if self.optimizer_refine is not None else None
+            )
             save_dict["scheduler_refine"] = (
                 self.scheduler_refine.state_dict() if self.scheduler_refine is not None else None
             )
         elif stage_name == "rnet":
-            save_dict["optimizer_refine"] = self.optimizer_refine.state_dict()
+            save_dict["optimizer_refine"] = (
+                self.optimizer_refine.state_dict() if self.optimizer_refine is not None else None
+            )
             save_dict["scheduler_refine"] = (
                 self.scheduler_refine.state_dict() if self.scheduler_refine is not None else None
             )
@@ -1171,6 +1359,8 @@ class Trainer:
         self.no_improve_rnet = ckpt.get("no_improve_rnet", 0)
         self.fit_cnet = ckpt.get("fit_cnet", True)
         self.fit_rnet = ckpt.get("fit_rnet", True)
+        if self.cfg.no_refine:
+            self.fit_rnet = False
         self.logger.info(
             f"  Resumed [{ckpt_stage}]: epoch={self.epoch}, step={self.global_step}"
         )
@@ -1251,10 +1441,13 @@ class Trainer:
                 val_token_f1 = val.get("val/token_f1", 0.0)
                 val_token_recall = val.get("val/token_recall", 0.0)
                 vt_cnet = val.get("val/loss_total", float("inf"))
+                pen_mm = val.get("val/pen_depth_mm", 0.0)
+                coarse_patience_active = self._is_coarse_patience_active(ep)
+                coarse_patience_start = self._coarse_patience_start_epoch()
                 self.logger.info(
                     f"  [VAL][Coarse] total={vt_cnet:.4f}  "
                     f"contact={val.get('val/contact_rate', 0):.3f}  "
-                    f"pen={val.get('val/pen_depth_mm', 0):.2f}mm  "
+                    f"pen={pen_mm:.2f}mm  "
                     f"token_f1={val_token_f1:.3f}  "
                     f"token_recall={val_token_recall:.3f}"
                 )
@@ -1292,21 +1485,29 @@ class Trainer:
                         self.no_improve_cnet = 0
                         self._save_checkpoint("best_cnet", stage="cnet")
                         if prev_best == float("inf"):
-                            self.logger.info(f"  * New best_cnet: total={vt_cnet:.4f}")
+                            self.logger.info(f"  * New best_cnet: val_total={vt_cnet:.4f}")
                         else:
                             self.logger.info(
-                                f"  * New best_cnet: total={vt_cnet:.4f} (prev={prev_best:.4f})"
+                                f"  * New best_cnet: val_total={vt_cnet:.4f} "
+                                f"(prev={prev_best:.4f})"
                             )
                     else:
-                        self.no_improve_cnet += 1
-                        remaining = max(cfg.early_stop_patience - self.no_improve_cnet, 0)
-                        self.logger.info(
-                            f"  [EARLY STOP][Coarse] no improvement for {self.no_improve_cnet}/"
-                            f"{cfg.early_stop_patience} (remaining={remaining})"
-                        )
-                        if self.no_improve_cnet >= cfg.early_stop_patience:
-                            self.fit_cnet = False
-                            self.logger.info("  [EARLY STOP][Coarse] disabled further CoarseNet updates.")
+                        if coarse_patience_active:
+                            self.no_improve_cnet += 1
+                            remaining = max(cfg.early_stop_patience - self.no_improve_cnet, 0)
+                            self.logger.info(
+                                f"  [EARLY STOP][Coarse] no total loss improvement for {self.no_improve_cnet}/"
+                                f"{cfg.early_stop_patience} (remaining={remaining})"
+                            )
+                            if self.no_improve_cnet >= cfg.early_stop_patience:
+                                self.fit_cnet = False
+                                self.logger.info("  [EARLY STOP][Coarse] disabled further CoarseNet updates.")
+                        else:
+                            self.no_improve_cnet = 0
+                            self.logger.info(
+                                f"  [EARLY STOP][Coarse] patience inactive during KL warmup "
+                                f"(starts at epoch {coarse_patience_start:.0f})"
+                            )
 
                 if self.fit_rnet:
                     if vt_rnet < self.best_loss_rnet:
@@ -1357,6 +1558,8 @@ def parse_args():
     # Slot supervision / part-contact auxiliaries
     p.add_argument("--bps_slot_cache_dir", type=str, default="cache/bps_slot",
                    help="Directory for per-object BPS slot cache")
+    p.add_argument("--predictor_ckpt", type=str, default="checkpoints/full/predictor/best_predictor.pt",
+                   help="Frozen BPSSlotPredictor checkpoint used to predict slot labels")
 
     # RefineNet
     p.add_argument("--refine_n_iters", type=int, default=3)
@@ -1367,13 +1570,12 @@ def parse_args():
                    help="Std of Gaussian noise added to GT translation for RefineNet training")
 
     # Part-Contact Loss
-    p.add_argument("--w_part_contact", type=float, default=5.0,
+    p.add_argument("--w_part_contact", type=float, default=10.0,
                    help="Weight for Part-Contact Consistency Loss")
 
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=5e-4)
-    p.add_argument("--warmup_steps", type=int,   default=1000)
     p.add_argument("--resume",       type=str,   default="")
     p.add_argument("--save_dir",     type=str,   default="checkpoints/full/decoder")
     p.add_argument("--log_dir",      type=str,   default="logs/full/decoder")
@@ -1383,10 +1585,16 @@ def parse_args():
     p.add_argument("--token_dropout_pivot", type=int, default=6,
                    help="Adaptive pivot used by token dropout")
     p.add_argument("--contact_thresh",  type=float, default=0.005)
+    p.add_argument("--token_eval_seed_base", type=int, default=12345,
+                   help="Fixed random seed for deterministic validation prior sampling")
 
     # Ablation
     p.add_argument("--no_token_cond", action="store_true",
                    help="Zero out token conditioning (ablation test)")
+    p.add_argument("--no_part_target_pos", action="store_true",
+                   help="Zero out slot-derived part_target_pos while keeping token histogram and valid_mask")
+    p.add_argument("--no_refine", action="store_true",
+                   help="Disable RefineNet training/validation (coarse-only ablation)")
 
     return p.parse_args()
 
@@ -1401,6 +1609,7 @@ def main():
         model_config=args.model_config,
         kl_coef=args.kl_coef,
         bps_slot_cache_dir=args.bps_slot_cache_dir,
+        predictor_ckpt=args.predictor_ckpt,
         refine_n_iters=args.refine_n_iters,
         refine_lr=args.refine_lr,
         refine_pose_noise_std=args.refine_pose_noise_std,
@@ -1409,7 +1618,6 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        warmup_steps=args.warmup_steps,
         resume=args.resume,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
@@ -1418,7 +1626,10 @@ def main():
         token_sub_prob=args.token_sub_prob,
         token_dropout_pivot=args.token_dropout_pivot,
         contact_thresh=args.contact_thresh,
+        token_eval_seed_base=args.token_eval_seed_base,
         no_token_cond=args.no_token_cond,
+        no_part_target_pos=args.no_part_target_pos,
+        no_refine=args.no_refine,
     )
     Trainer(cfg).train()
 

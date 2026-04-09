@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "dataset_name": "AffordPose",
+  "dataset_root": "/home/kingston/wzc/data/AffordPose",
+  "canonical_slots": {
+    "-1": "UNASSIGNED",
+    "0": "GRASP_SURFACE",
+    "1": "FUNCTIONAL_END",
+    "2": "CONTROL",
+    "3": "CLOSURE"
+  },
+  "notes": [
+    "raw_part_labels below are confirmed mappings for the 6 AffordPose categories currently used in dhoi.",
+    "Mappings were reviewed by representative-label visualization and GT hand-contact diagnostics on 475 object-affordance entries (2026-04-08).",
+    "Canonical slot_id mapping: 0=GRASP_SURFACE, 1=FUNCTIONAL_END, 2=CONTROL, 3=CLOSURE, -1=UNASSIGNED."
+  ],
+  "categories": {
+    "bottle": {
+      "num_objects": 52,
+      "observed_affordances": [
+        "Twist",
+        "Wrap-grasp"
+      ],
+      "affordance_counts": {
+        "Twist": 51,
+        "Wrap-grasp": 52
+      },
+      "observed_raw_part_labels": [
+        0,
+        5,
+        6
+      ],
+      "raw_part_label_presence_count": {
+        "0": 36,
+        "5": 103,
+        "6": 102
+      },
+      "observed_label_sets": [
+        [
+          5,
+          6
+        ],
+        [
+          0,
+          5,
+          6
+        ],
+        [
+          5
+        ]
+      ],
+      "manifest_examples": [
+        "bottle_3415_Twist",
+        "bottle_3415_Wrap-grasp",
+        "bottle_3418_Twist"
+      ],
+      "affordance_slot_priors": {
+        "Twist": "CLOSURE",
+        "Wrap-grasp": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "CLOSURE",
+          "slot_id": 3,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Observed near the bottle top in the inspected Twist/Wrap-grasp previews. Treated as a cap-adjacent closure region for dhoi slot mapping."
+        },
+        "5": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Dominant bottle body region in the inspected samples. Used as the main wrap-graspable surface."
+        },
+        "6": {
+          "slot_name": "CLOSURE",
+          "slot_id": 3,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Top-region label co-occurring with Twist in inspected bottle previews. Treated as the primary closure/cap region."
+        }
+      }
+    },
+    "dispenser": {
+      "num_objects": 34,
+      "observed_affordances": [
+        "Press",
+        "Twist",
+        "Wrap-grasp"
+      ],
+      "affordance_counts": {
+        "Press": 34,
+        "Twist": 31,
+        "Wrap-grasp": 34
+      },
+      "observed_raw_part_labels": [
+        0,
+        3,
+        5,
+        6
+      ],
+      "raw_part_label_presence_count": {
+        "0": 31,
+        "3": 99,
+        "5": 99,
+        "6": 93
+      },
+      "observed_label_sets": [
+        [
+          3,
+          5,
+          6
+        ],
+        [
+          0,
+          3,
+          5,
+          6
+        ],
+        [
+          0,
+          3,
+          5
+        ],
+        [
+          3,
+          5
+        ]
+      ],
+      "manifest_examples": [
+        "dispenser_101442_Press",
+        "dispenser_101442_Twist",
+        "dispenser_101442_Wrap-grasp"
+      ],
+      "affordance_slot_priors": {
+        "Press": "CONTROL",
+        "Twist": "CLOSURE",
+        "Wrap-grasp": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "UNASSIGNED",
+          "slot_id": -1,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Tiny dispenser top patch with limited and mixed GT contact. Kept as UNASSIGNED after GT hand-contact diagnostics because mapping it to a semantic slot slightly hurts dominant-part accuracy."
+        },
+        "3": {
+          "slot_name": "CONTROL",
+          "slot_id": 2,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Top actuator/head region nearest to the hand in Press samples. Treated as the main pressable control surface."
+        },
+        "5": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Large dispenser body region. This is the most natural wrap-grasp surface and is also contacted in Twist samples."
+        },
+        "6": {
+          "slot_name": "CLOSURE",
+          "slot_id": 3,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Narrow neck/collar region between the body and actuator. It is close to the hand in Twist samples and is used as the twistable closure-like part."
+        }
+      }
+    },
+    "earphone": {
+      "num_objects": 50,
+      "observed_affordances": [
+        "Lift"
+      ],
+      "affordance_counts": {
+        "Lift": 50
+      },
+      "observed_raw_part_labels": [
+        0,
+        4
+      ],
+      "raw_part_label_presence_count": {
+        "0": 50,
+        "4": 50
+      },
+      "observed_label_sets": [
+        [
+          0,
+          4
+        ]
+      ],
+      "manifest_examples": [
+        "earphone_10000_Lift",
+        "earphone_10003_Lift",
+        "earphone_10034_Lift"
+      ],
+      "affordance_slot_priors": {
+        "Lift": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Large earphone surface group including liftable buds/loop-like structures. Although not always the closest contact region, it is a valid lift/grasp surface across inspected samples."
+        },
+        "4": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Secondary earphone region that is often the closest part to the hand in inspected Lift samples. Collapsed into grasp surface as well."
+        }
+      }
+    },
+    "knife": {
+      "num_objects": 57,
+      "observed_affordances": [
+        "Handle-grasp"
+      ],
+      "affordance_counts": {
+        "Handle-grasp": 57
+      },
+      "observed_raw_part_labels": [
+        0,
+        1
+      ],
+      "raw_part_label_presence_count": {
+        "0": 57,
+        "1": 57
+      },
+      "observed_label_sets": [
+        [
+          0,
+          1
+        ]
+      ],
+      "manifest_examples": [
+        "knife_1000_Handle-grasp",
+        "knife_1001_Handle-grasp",
+        "knife_1002_Handle-grasp"
+      ],
+      "affordance_slot_priors": {
+        "Handle-grasp": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "FUNCTIONAL_END",
+          "slot_id": 1,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Long distal region far from the hand in inspected knife previews (1000/1001). Mapped to the blade / functional end."
+        },
+        "1": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Compact region nearest to the hand in inspected knife previews (1000/1001). Mapped to the handle / grasp surface."
+        }
+      }
+    },
+    "mug": {
+      "num_objects": 55,
+      "observed_affordances": [
+        "Handle-grasp",
+        "Support",
+        "Wrap-grasp"
+      ],
+      "affordance_counts": {
+        "Handle-grasp": 52,
+        "Support": 2,
+        "Wrap-grasp": 55
+      },
+      "observed_raw_part_labels": [
+        0,
+        1,
+        5,
+        7
+      ],
+      "raw_part_label_presence_count": {
+        "0": 37,
+        "1": 106,
+        "5": 109,
+        "7": 6
+      },
+      "observed_label_sets": [
+        [
+          1,
+          5
+        ],
+        [
+          0,
+          1,
+          5
+        ],
+        [
+          0,
+          1,
+          5,
+          7
+        ],
+        [
+          1,
+          5,
+          7
+        ],
+        [
+          0,
+          5
+        ],
+        [
+          5
+        ]
+      ],
+      "manifest_examples": [
+        "mug_8554_Handle-grasp",
+        "mug_8554_Wrap-grasp",
+        "mug_8555_Handle-grasp"
+      ],
+      "affordance_slot_priors": {
+        "Handle-grasp": "GRASP_SURFACE",
+        "Support": "GRASP_SURFACE",
+        "Wrap-grasp": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Rare mug sub-region observed mostly in Wrap-grasp GT contacts. Promoted to GRASP_SURFACE after GT hand-contact diagnostics; keeping it graspable is more faithful than leaving it unassigned."
+        },
+        "1": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Handle-like region closest to the hand in inspected mug Handle-grasp samples. Mapped to grasp surface."
+        },
+        "5": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Main mug body / wrap-grasp surface in inspected Handle-grasp and Wrap-grasp samples."
+        },
+        "7": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Rare mug region observed in Support samples; appears to cover a broad support/base contact surface. Collapsed into grasp surface as the closest dhoi slot."
+        }
+      }
+    },
+    "scissors": {
+      "num_objects": 57,
+      "observed_affordances": [
+        "Handle-grasp"
+      ],
+      "affordance_counts": {
+        "Handle-grasp": 57
+      },
+      "observed_raw_part_labels": [
+        0,
+        1,
+        9
+      ],
+      "raw_part_label_presence_count": {
+        "0": 57,
+        "1": 57,
+        "9": 1
+      },
+      "observed_label_sets": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          9
+        ]
+      ],
+      "manifest_examples": [
+        "scissors_10412_Handle-grasp",
+        "scissors_10429_Handle-grasp",
+        "scissors_10431_Handle-grasp"
+      ],
+      "affordance_slot_priors": {
+        "Handle-grasp": "GRASP_SURFACE"
+      },
+      "raw_part_labels": {
+        "0": {
+          "slot_name": "FUNCTIONAL_END",
+          "slot_id": 1,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Thin distal blade region far from the hand in inspected scissors previews (10412/10429/10483). Mapped to functional end."
+        },
+        "1": {
+          "slot_name": "GRASP_SURFACE",
+          "slot_id": 0,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Handle-loop region nearest to the hand in inspected scissors previews. Mapped to grasp surface."
+        },
+        "9": {
+          "slot_name": "UNASSIGNED",
+          "slot_id": -1,
+          "status": "confirmed",
+          "notes": "Confirmed by representative visual inspection and GT hand-contact diagnostics. Tiny rare region seen only in scissors_10483, likely a hinge/connector sub-part. Left unassigned rather than forcing it into a dhoi slot."
+        }
+      }
+    }
+  },
+  "mapping_review": {
+    "date": "2026-04-08",
+    "method": "visual inspection + GT hand-contact diagnostics",
+    "diagnostic_report": "configs/affordpose_mapping_diagnostics.json"
+  }
+}

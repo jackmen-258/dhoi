@@ -668,9 +668,8 @@ class PoseGrabModel(nn.Module):
         v_weights: torch.Tensor,
         v_weights2: torch.Tensor,
         batch_size: int,
-        obj_normals: torch.Tensor = None,
     ) -> tuple:
-        """CoarseNet loss with signed h2o distances for penetration awareness."""
+        """CoarseNet loss with GrabNet-style distance and reconstruction terms."""
         device = verts_gt.device
         dtype = verts_gt.dtype
 
@@ -678,14 +677,12 @@ class PoseGrabModel(nn.Module):
         rh_mesh = _compute_vertex_normals(verts_pred, faces_t)
         rh_mesh_gt = _compute_vertex_normals(verts_gt, faces_t)
 
-        # GrabNet-faithful: hand normals for o2h sign, NO object normals for h2o
-        # h2o uses unsigned distance (object normals are noisy on sampled point clouds)
         o2h_signed, h2o, _ = point2point_signed(
             verts_pred, verts_object, rh_mesh)       # h2o is unsigned
         o2h_signed_gt, h2o_gt, _ = point2point_signed(
             verts_gt, verts_object, rh_mesh_gt)
 
-        # Adaptive weights for o2h loss (penetration-aware)
+        # Adaptive weights for o2h loss
         w_dist = (o2h_signed_gt < 0.01) & (o2h_signed_gt > -0.005)
         w_dist_neg = o2h_signed < 0.0
         w = torch.ones(verts_object.shape[0], verts_object.shape[1], device=device)
@@ -826,90 +823,6 @@ class PoseGrabModel(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-
-# ==============================================================================
-# GrabNet-style geometric auxiliary loss
-# ==============================================================================
-
-def compute_geo_loss(
-    pred: PoseDecoderOutput,
-    gt_verts: torch.Tensor,
-    obj_pc: torch.Tensor,
-    mano_fn,
-    obj_normals: torch.Tensor | None = None,
-    w_vert: float = 10.0,
-    w_dist_h: float = 5.0,
-    w_dist_o: float = 5.0,
-    w_pen: float = 10.0,
-    reduction: str = "mean",
-):
-    """GrabNet-inspired geometric supervision."""
-    if reduction not in {"mean", "none"}:
-        raise ValueError(f"Unsupported reduction: {reduction}")
-
-    def _safe_vertex_normals(verts, faces):
-        if faces is None:
-            return None
-        if not torch.is_tensor(faces):
-            faces_t = torch.as_tensor(faces, device=verts.device, dtype=torch.long)
-        else:
-            faces_t = faces.to(device=verts.device, dtype=torch.long)
-        if faces_t.numel() == 0:
-            return None
-        return _compute_vertex_normals(verts, faces_t)
-
-    pred_verts, _ = mano_fn(pred.pose, pred.trans, pred.shape)
-    mano_faces = getattr(mano_fn, "faces", None)
-    pred_hand_normals = _safe_vertex_normals(pred_verts, mano_faces)
-    gt_hand_normals = _safe_vertex_normals(gt_verts, mano_faces)
-    B = pred_verts.shape[0]
-
-    def mean_per_sample(x):
-        return x.reshape(B, -1).mean(dim=1)
-
-    loss_vert = mean_per_sample(torch.abs(pred_verts - gt_verts))
-
-    if obj_normals is not None:
-        o2h_signed, h2o_signed, _ = point2point_signed(
-            pred_verts, obj_pc, x_normals=pred_hand_normals, y_normals=obj_normals)
-        o2h_gt, h2o_gt, _ = point2point_signed(
-            gt_verts, obj_pc, x_normals=gt_hand_normals, y_normals=obj_normals)
-    else:
-        o2h_signed, h2o_signed, _ = point2point_signed(pred_verts, obj_pc)
-        o2h_gt, h2o_gt, _ = point2point_signed(gt_verts, obj_pc)
-
-    loss_dist_h = mean_per_sample(torch.abs(h2o_signed.abs() - h2o_gt.abs()))
-    loss_dist_o = mean_per_sample(torch.abs(o2h_signed - o2h_gt))
-
-    if obj_normals is not None:
-        pen_depth = torch.relu(-h2o_signed)
-        is_pen = pen_depth > 0
-        n_pen = is_pen.float().sum(dim=1).clamp(min=1.0)
-        loss_pen = pen_depth.sum(dim=1) / n_pen
-        pen_mean_all = pen_depth.mean(dim=1)
-    else:
-        loss_pen = pred_verts.new_zeros(B)
-        pen_mean_all = pred_verts.new_zeros(B)
-
-    loss_per_sample = (
-        w_vert * loss_vert
-        + w_dist_h * loss_dist_h
-        + w_dist_o * loss_dist_o
-        + w_pen * loss_pen
-    )
-
-    loss = loss_per_sample.mean() if reduction == "mean" else loss_per_sample
-
-    return loss, {
-        "geo_loss": loss_per_sample.mean().item(),
-        "geo_vert": loss_vert.mean().item(),
-        "geo_dist_h": loss_dist_h.mean().item(),
-        "geo_dist_o": loss_dist_o.mean().item(),
-        "geo_pen": loss_pen.mean().item(),
-        "geo_pen_all": pen_mean_all.mean().item(),
-    }
-
 
 # ==============================================================================
 # Part-Contact Consistency Loss

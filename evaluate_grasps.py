@@ -7,8 +7,8 @@ evaluate_grasps.py — 评估生成抓握的物理质量 + 语义一致性
   - Intersection Volume (cm³):    手-物体交叉体积, 越低越好
   - Simulation Displacement (cm): 物理仿真中物体位移, 越低越好
   - Contact Ratio:                近表面接触样本比例, 越高越好
-  - Contact Token F1:             最终 hand pose 反推接触矩阵，与 conditioning tokens 的 F1
-  - Slot Hit Rate:                折叠 hand_part 后，GT slot 中被命中的比例
+  - Part Accuracy:                Text2Grasp-style dominant contacted part accuracy
+  - Part Ratio:                   接触点中落在目标 part/slot 上的比例
 
 依赖:
   - lib.metrics.penetration      (穿透深度)
@@ -22,6 +22,7 @@ evaluate_grasps.py — 评估生成抓握的物理质量 + 语义一致性
 """
 
 import os
+import json
 import argparse
 import pickle
 import logging
@@ -35,10 +36,11 @@ from joblib import Parallel, delayed
 from scipy.spatial import cKDTree
 
 from data.token_encoder import TokenEncoder
+from data.text_generator import SLOT_NAME_BY_CATEGORY, DEFAULT_SLOT_NAME
 from metrics.basic_metric import AverageMeter
+from metrics.diversity import diversity_details, joints_to_diversity_feature
 from metrics.penetration import penetration
 from metrics.intersection import solid_intersection_volume
-from metrics.simulator import simulation_sample
 from utils.mano_utils import MANOHelper
 
 logging.basicConfig(
@@ -155,30 +157,8 @@ def min_surface_distance(obj_mesh: trimesh.Trimesh, query_points: np.ndarray) ->
     return float(dist.min()) if dist.size > 0 else float("inf")
 
 
-# ==============================================================================
-# 语义指标
-# ==============================================================================
-
-def compute_token_recall_f1(pred_matrix: np.ndarray, gt_matrix: np.ndarray) -> tuple[float, float]:
-    """Compute token recall/F1 directly from predicted vs GT contact matrices."""
-    pred_hist = (np.asarray(pred_matrix) >= 0).reshape(-1).astype(np.float32)
-    gt_hist = (np.asarray(gt_matrix) >= 0).reshape(-1).astype(np.float32)
-
-    tp = float((pred_hist * gt_hist).sum())
-    pred_pos = float(pred_hist.sum())
-    gt_pos = float(gt_hist.sum())
-
-    precision = tp / pred_pos if pred_pos > 0 else 0.0
-    recall = tp / gt_pos if gt_pos > 0 else 0.0
-
-    denom = precision + recall
-    if denom <= 0:
-        return float(recall), 0.0
-    return float(recall), float(2.0 * precision * recall / denom)
-
-
 class SemanticMetricHelper:
-    """Recover contact semantics from the final hand pose and compare with tokens."""
+    """Recover Text2Grasp-style target part accuracy from final hand pose."""
 
     def __init__(
         self,
@@ -277,31 +257,125 @@ class SemanticMetricHelper:
 
         return contact_matrix
 
-    def compute_metrics(self, item: dict, hand_verts: np.ndarray, obj_points: np.ndarray):
-        tokens = np.asarray(item.get("tokens", np.array([])), dtype=np.int64)
-        if tokens.size == 0:
-            return None
+    def recover_contact_slot_counts(
+        self,
+        hand_verts: np.ndarray,
+        obj_points: np.ndarray,
+        obj_slot_labels: np.ndarray,
+    ) -> tuple[np.ndarray, int]:
+        """Count object-side contacts per slot using nearest hand-vertex distance.
 
+        This follows the spirit of Text2Grasp's part-accuracy metric:
+        determine which object part/slot receives the most contact points.
+        """
+        hand_tree = cKDTree(np.asarray(hand_verts, dtype=np.float32))
+        dist, _ = hand_tree.query(np.asarray(obj_points, dtype=np.float32), k=1)
+        slots = np.asarray(obj_slot_labels, dtype=np.int64)
+        valid_mask = slots >= 0
+        contact_mask = (dist < self.contact_distance) & valid_mask
+
+        if not np.any(contact_mask):
+            return np.zeros(self.num_slots, dtype=np.int64), 0
+
+        contact_slots = slots[contact_mask]
+        counts = np.bincount(contact_slots, minlength=self.num_slots).astype(np.int64)
+        return counts, int(contact_mask.sum())
+
+    def _phrase_candidates_for_slot(self, cate_id: str, slot_name: str) -> list[str]:
+        cate_key = str(cate_id or "").lower().strip()
+        cate_map = SLOT_NAME_BY_CATEGORY.get(cate_key, {})
+        base_phrase = str(cate_map.get(slot_name, DEFAULT_SLOT_NAME.get(slot_name, slot_name.lower()))).lower().strip()
+
+        candidates = [base_phrase]
+        if " or " in base_phrase:
+            candidates.extend(part.strip() for part in base_phrase.split(" or "))
+        if " and " in base_phrase:
+            candidates.extend(part.strip() for part in base_phrase.split(" and "))
+
+        extras = {
+            "GRASP_SURFACE": ["body", "handle", "grip", "barrel"],
+            "FUNCTIONAL_END": ["blade", "tip", "nozzle", "opening", "spout", "lens", "head"],
+            "CONTROL": ["trigger", "button", "pump top", "control panel", "control area"],
+            "CLOSURE": ["cap", "lid"],
+        }
+        candidates.extend(extras.get(slot_name, []))
+        return sorted({c.strip() for c in candidates if c and len(c.strip()) >= 3}, key=len, reverse=True)
+
+    def infer_target_from_text(self, item: dict) -> tuple[np.ndarray | None, int | None]:
+        explicit_targets = item.get("text_target_slots", None)
+        explicit_primary = item.get("text_primary_slot", None)
+
+        if explicit_targets is not None:
+            target_slots = np.asarray(explicit_targets, dtype=np.int64).reshape(-1)
+            target_slots = target_slots[(target_slots >= 0) & (target_slots < self.num_slots)]
+            if target_slots.size > 0:
+                primary_slot = None
+                if explicit_primary is not None:
+                    primary_slot = int(explicit_primary)
+                    if not (0 <= primary_slot < self.num_slots):
+                        primary_slot = None
+                if primary_slot is None:
+                    primary_slot = int(target_slots[0])
+                return target_slots, primary_slot
+
+        text = str(item.get("text_prompt", item.get("text", "")) or "").lower().strip()
+        if not text:
+            return None, None
+
+        cate_id = item.get("class_name", item.get("cate_id", ""))
+        hits = []
+        for slot_id, slot_name in enumerate(self.token_encoder.mapper.canonical_slots):
+            for phrase in self._phrase_candidates_for_slot(cate_id, slot_name):
+                pos = text.find(phrase)
+                if pos >= 0:
+                    hits.append((pos, slot_id))
+                    break
+
+        if not hits:
+            return None, None
+
+        hits.sort(key=lambda x: x[0])
+        target_slots = np.asarray(sorted({slot_id for _, slot_id in hits}), dtype=np.int64)
+        primary_slot = int(hits[0][1])
+        return target_slots, primary_slot
+
+    def compute_metrics(self, item: dict, hand_verts: np.ndarray, obj_points: np.ndarray):
         slot_data = self._load_obj_slot_data(item["obj_id"])
         if slot_data is None:
             return None
 
-        gt_matrix = self.token_encoder.decode(tokens)
         obj_slot_labels = self.propagate_slot_labels(
             obj_points=np.asarray(obj_points, dtype=np.float32),
             obj_scale=slot_data["obj_scale"],
             bps_slot_labels=slot_data["bps_slot_labels"],
         )
-        pred_matrix = self.recover_contact_matrix(
+        target_slots, primary_slot = self.infer_target_from_text(item)
+        if target_slots is None or target_slots.size == 0 or primary_slot is None:
+            return None
+
+        slot_contact_counts, n_contact = self.recover_contact_slot_counts(
             hand_verts=np.asarray(hand_verts, dtype=np.float32),
             obj_points=np.asarray(obj_points, dtype=np.float32),
             obj_slot_labels=obj_slot_labels,
         )
 
-        token_recall, token_f1 = compute_token_recall_f1(pred_matrix, gt_matrix)
+        if n_contact <= 0:
+            return {
+                "part_acc": 0.0,
+                "part_ratio": 0.0,
+                "target_slots": target_slots.tolist(),
+                "dominant_part": None,
+            }
+
+        dominant_slot = int(slot_contact_counts.argmax())
+        part_acc = 1.0 if dominant_slot == int(primary_slot) else 0.0
+        part_ratio = float(slot_contact_counts[target_slots].sum()) / float(n_contact)
         return {
-            "token_f1": token_f1,
-            "token_recall": token_recall,
+            "part_acc": float(part_acc),
+            "part_ratio": float(part_ratio),
+            "target_slots": target_slots.tolist(),
+            "primary_slot": int(primary_slot),
+            "dominant_part": dominant_slot,
         }
 
 
@@ -429,6 +503,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
 
     sample_id = item["sample_id"]
 
+    from metrics.simulator import simulation_sample
+
     # ---- 手部顶点有效性 ----
     hand_verts = np.asarray(item.get("hand_verts_r", np.array([])), dtype=np.float32)
     ok, reason = check_hand_verts(hand_verts, sample_id)
@@ -449,8 +525,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
     obj_element_volume = obj_vox.element_volume
 
     semantic_metrics = {
-        "token_f1": None,
-        "token_recall": None,
+        "part_acc": None,
+        "part_ratio": None,
     }
     if semantic_helper is not None:
         try:
@@ -541,8 +617,8 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
         "sims_disp": float(sims_disp),
         "min_contact_dist": float(min_contact_dist),
         "near_contact": bool(min_contact_dist <= contact_thresh),
-        "token_f1": semantic_metrics["token_f1"],
-        "token_recall": semantic_metrics["token_recall"],
+        "part_acc": semantic_metrics["part_acc"],
+        "part_ratio": semantic_metrics["part_ratio"],
     }
 
 
@@ -550,7 +626,175 @@ def evaluate_single_grasp(idx, loader, sims_dir, contact_thresh, semantic_helper
 # 汇总
 # ==============================================================================
 
-def evaluate(args):
+def _diversity_group_key(item: dict, group_by: str) -> str:
+    obj_id = str(item.get("obj_id", "unknown_obj"))
+
+    if group_by == "group_id":
+        return str(item.get("group_id", item.get("manifest_key", f"{obj_id}::{item.get('sample_idx', 'unknown')}")))
+    if group_by == "obj_id":
+        return obj_id
+    if group_by == "obj_sample":
+        sample_idx = item.get("sample_idx", "unknown")
+        return f"{obj_id}::{sample_idx}"
+    raise ValueError(f"Unsupported diversity_group_by: {group_by}")
+
+
+def evaluate_diversity(args):
+    results_dir = os.path.join(args.exp_path, "results")
+    eval_dir = os.path.join(args.exp_path, "evaluations_diversity")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    if not os.path.isdir(results_dir):
+        raise FileNotFoundError(f"Results directory not found: {results_dir}")
+
+    grasp_files = sorted(
+        os.path.join(results_dir, f)
+        for f in os.listdir(results_dir)
+        if f.endswith(".pkl")
+    )
+    logger.info(f"Diversity mode: loading {len(grasp_files)} result files...")
+
+    grouped_features = defaultdict(list)
+    grouped_meta = {}
+    all_features = []
+    skipped_load = 0
+    skipped_feature = 0
+
+    for path in grasp_files:
+        try:
+            with open(path, "rb") as f:
+                item = pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Skipping unreadable result {path}: {e}")
+            skipped_load += 1
+            continue
+
+        feat = joints_to_diversity_feature(
+            item.get("hand_joints_r", None),
+            unit=args.diversity_unit,
+            canonical=args.diversity_canonical,
+        )
+        if feat is None:
+            skipped_feature += 1
+            continue
+
+        group_key = _diversity_group_key(item, args.diversity_group_by)
+        grouped_features[group_key].append(feat)
+        all_features.append(feat)
+        if group_key not in grouped_meta:
+            grouped_meta[group_key] = {
+                "group_id": group_key,
+                "obj_id": item.get("obj_id"),
+                "sample_idx": item.get("sample_idx"),
+                "manifest_key": item.get("manifest_key"),
+                "class_name": item.get("class_name"),
+                "afford_name": item.get("afford_name"),
+            }
+
+    total_groups = len(grouped_features)
+    valid_group_records = []
+    singleton_groups = 0
+    valid_group_sizes = []
+
+    for group_key, feats in grouped_features.items():
+        if len(feats) < 2:
+            singleton_groups += 1
+            continue
+
+        details = diversity_details(np.asarray(feats, dtype=np.float32), cls_num=args.diversity_cls_num)
+        details.update(grouped_meta.get(group_key, {}))
+        details["num_samples"] = len(feats)
+        valid_group_records.append(details)
+        valid_group_sizes.append(len(feats))
+
+    global_details = diversity_details(np.asarray(all_features, dtype=np.float32), cls_num=args.diversity_cls_num)
+
+    mean_entropy = float(np.mean([r["entropy"] for r in valid_group_records])) if valid_group_records else 0.0
+    mean_cluster_size = float(np.mean([r["cluster_size"] for r in valid_group_records])) if valid_group_records else 0.0
+    std_entropy = float(np.std([r["entropy"] for r in valid_group_records])) if valid_group_records else 0.0
+    std_cluster_size = float(np.std([r["cluster_size"] for r in valid_group_records])) if valid_group_records else 0.0
+    mean_cluster_spread = float(np.mean([r.get("cluster_spread", 0.0) for r in valid_group_records])) if valid_group_records else 0.0
+    std_cluster_spread = float(np.std([r.get("cluster_spread", 0.0) for r in valid_group_records])) if valid_group_records else 0.0
+    avg_group_size = float(np.mean(valid_group_sizes)) if valid_group_sizes else 0.0
+
+    summary = {
+        "total_files": len(grasp_files),
+        "valid_features": len(all_features),
+        "skipped_load": skipped_load,
+        "skipped_feature": skipped_feature,
+        "group_by": args.diversity_group_by,
+        "groups_total": total_groups,
+        "groups_valid": len(valid_group_records),
+        "groups_skipped_singleton": singleton_groups,
+        "avg_group_size": avg_group_size,
+        "cls_num": int(args.diversity_cls_num),
+        "unit": args.diversity_unit,
+        "canonical": bool(args.diversity_canonical),
+        "cluster_size_definition": "mean number of samples per active cluster after k-means",
+        "cluster_spread_definition": f"mean distance to assigned k-means center ({args.diversity_unit})",
+        "grouped_mean_entropy": mean_entropy,
+        "grouped_std_entropy": std_entropy,
+        "grouped_mean_cluster_size": mean_cluster_size,
+        "grouped_std_cluster_size": std_cluster_size,
+        "grouped_mean_cluster_spread": mean_cluster_spread,
+        "grouped_std_cluster_spread": std_cluster_spread,
+        "global_entropy": float(global_details["entropy"]),
+        "global_cluster_size": float(global_details["cluster_size"]),
+        "global_cluster_spread": float(global_details.get("cluster_spread", 0.0)),
+        "records": valid_group_records,
+    }
+
+    with open(os.path.join(eval_dir, "diversity_results.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  DIVERSITY RESULTS")
+    print(f"{sep}")
+    print(f"  Total result files:       {summary['total_files']}")
+    print(f"  Valid features:           {summary['valid_features']}")
+    print(f"  Skipped load/feature:     {summary['skipped_load']}/{summary['skipped_feature']}")
+    print(f"  Group by:                 {summary['group_by']}")
+    print(f"  Valid groups (>=2):       {summary['groups_valid']} / {summary['groups_total']}")
+    print(f"  Avg valid group size:     {summary['avg_group_size']:.4f}")
+    print(f"  Entropy (grouped mean):   {summary['grouped_mean_entropy']:.4f} ± {summary['grouped_std_entropy']:.4f}")
+    print(f"  Cluster Size (grouped):   {summary['grouped_mean_cluster_size']:.4f} ± {summary['grouped_std_cluster_size']:.4f}")
+    print(f"  Cluster Spread (grouped): {summary['grouped_mean_cluster_spread']:.4f} ± {summary['grouped_std_cluster_spread']:.4f}")
+    print(f"  Entropy (global):         {summary['global_entropy']:.4f}")
+    print(f"  Cluster Size (global):    {summary['global_cluster_size']:.4f}")
+    print(f"  Cluster Spread (global):  {summary['global_cluster_spread']:.4f}")
+    print(f"{sep}")
+
+    report_path = os.path.join(eval_dir, "Metric.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Total result files:              {summary['total_files']}\n")
+        f.write(f"Valid features:                  {summary['valid_features']}\n")
+        f.write(f"Skipped load:                    {summary['skipped_load']}\n")
+        f.write(f"Skipped invalid feature:         {summary['skipped_feature']}\n")
+        f.write(f"Group By:                        {summary['group_by']}\n")
+        f.write(f"Groups total:                    {summary['groups_total']}\n")
+        f.write(f"Groups valid (>=2):              {summary['groups_valid']}\n")
+        f.write(f"Groups skipped singleton:        {summary['groups_skipped_singleton']}\n")
+        f.write(f"Avg valid group size:            {summary['avg_group_size']:.4f}\n")
+        f.write(f"KMeans cls_num (max):            {summary['cls_num']}\n")
+        f.write(f"Unit:                            {summary['unit']}\n")
+        f.write(f"Canonical:                       {int(summary['canonical'])}\n")
+        f.write(f"Cluster Size Definition:         {summary['cluster_size_definition']}\n")
+        f.write(f"Cluster Spread Definition:       {summary['cluster_spread_definition']}\n")
+        f.write(f"Entropy (grouped mean, ln):      {summary['grouped_mean_entropy']:.4f}\n")
+        f.write(f"Entropy (grouped std, ln):       {summary['grouped_std_entropy']:.4f}\n")
+        f.write(f"Cluster Size (grouped mean):     {summary['grouped_mean_cluster_size']:.4f}\n")
+        f.write(f"Cluster Size (grouped std):      {summary['grouped_std_cluster_size']:.4f}\n")
+        f.write(f"Cluster Spread (grouped mean):   {summary['grouped_mean_cluster_spread']:.4f}\n")
+        f.write(f"Cluster Spread (grouped std):    {summary['grouped_std_cluster_spread']:.4f}\n")
+        f.write(f"Entropy (global, ln):            {summary['global_entropy']:.4f}\n")
+        f.write(f"Cluster Size (global):           {summary['global_cluster_size']:.4f}\n")
+        f.write(f"Cluster Spread (global):         {summary['global_cluster_spread']:.4f}\n")
+
+    logger.info(f"Diversity results saved to: {eval_dir}")
+
+
+def evaluate_quality(args):
     results_dir = os.path.join(args.exp_path, "results")
     sims_dir    = os.path.join(args.exp_path, "simulation")
     eval_dir    = os.path.join(args.exp_path, "evaluations")
@@ -601,8 +845,8 @@ def evaluate(args):
     sims_disp_list  = []
     min_contact_dist_meter = AverageMeter("min_contact_dist")
     contact_count   = 0
-    token_f1_list = []
-    token_recall_list = []
+    part_acc_list = []
+    part_ratio_list = []
 
     for r in valid:
         pentr_dep_meter.update(r["pentr_dep"])
@@ -612,10 +856,10 @@ def evaluate(args):
         min_contact_dist_meter.update(r["min_contact_dist"])
         if r["near_contact"]:
             contact_count += 1
-        if r.get("token_f1") is not None:
-            token_f1_list.append(float(r["token_f1"]))
-        if r.get("token_recall") is not None:
-            token_recall_list.append(float(r["token_recall"]))
+        if r.get("part_acc") is not None:
+            part_acc_list.append(float(r["part_acc"]))
+        if r.get("part_ratio") is not None:
+            part_ratio_list.append(float(r["part_ratio"]))
 
     n_valid        = len(valid)
     contact_ratio  = contact_count / n_valid if n_valid > 0 else 0.0
@@ -628,11 +872,11 @@ def evaluate(args):
     sims_disp_cm  = sims_disp_meter.avg * s
     sims_disp_std = float(np.std(sims_disp_list)) * s if sims_disp_list else 0.0
     min_contact_dist_mm = min_contact_dist_meter.avg * 1000.0
-    token_f1 = (
-        float(np.mean(token_f1_list)) if token_f1_list else None
+    part_acc = (
+        float(np.mean(part_acc_list)) if part_acc_list else None
     )
-    token_recall = (
-        float(np.mean(token_recall_list)) if token_recall_list else None
+    part_ratio = (
+        float(np.mean(part_ratio_list)) if part_ratio_list else None
     )
 
     # ---- 保存详细结果 ----
@@ -653,14 +897,14 @@ def evaluate(args):
     print(f"  Sim Displacement (cm):   {sims_disp_cm:.6f} ± {sims_disp_std:.6f}")
     print(f"  Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}")
     print(f"  Min Surface Dist (mm):   {min_contact_dist_mm:.6f}")
-    if token_f1 is not None:
-        print(f"  Token F1:               {token_f1:.4f}")
+    if part_acc is not None:
+        print(f"  Part Accuracy:          {part_acc:.4f}")
     else:
-        print(f"  Token F1:               N/A")
-    if token_recall is not None:
-        print(f"  Token Recall:           {token_recall:.4f}")
+        print(f"  Part Accuracy:          N/A")
+    if part_ratio is not None:
+        print(f"  Part Ratio:             {part_ratio:.4f}")
     else:
-        print(f"  Token Recall:           N/A")
+        print(f"  Part Ratio:             N/A")
     print(f"{sep}")
 
     # ---- 保存文本报告 ----
@@ -675,14 +919,14 @@ def evaluate(args):
         f.write(f"Sim Displacement (std, cm):      {sims_disp_std:.6f}\n")
         f.write(f"Contact Ratio (<= {args.contact_thresh * 1000:.1f}mm): {contact_ratio:.4f}\n")
         f.write(f"Min Surface Dist (mean, mm):     {min_contact_dist_mm:.6f}\n")
-        if token_f1 is not None:
-            f.write(f"Token F1 (mean):                 {token_f1:.4f}\n")
+        if part_acc is not None:
+            f.write(f"Part Accuracy (mean):            {part_acc:.4f}\n")
         else:
-            f.write("Token F1 (mean):                 N/A\n")
-        if token_recall is not None:
-            f.write(f"Token Recall (mean):             {token_recall:.4f}\n")
+            f.write("Part Accuracy (mean):            N/A\n")
+        if part_ratio is not None:
+            f.write(f"Part Ratio (mean):               {part_ratio:.4f}\n")
         else:
-            f.write("Token Recall (mean):             N/A\n")
+            f.write("Part Ratio (mean):               N/A\n")
 
     logger.info(f"Results saved to: {eval_dir}")
 
@@ -693,6 +937,9 @@ def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Evaluate generated grasps")
+    parser.add_argument("--mode", type=str, default="quality",
+                        choices=["quality", "diversity"],
+                        help="Evaluation mode")
     parser.add_argument("--exp_path", type=str, required=True,
                         help="Experiment directory (contains 'results/')")
     parser.add_argument("--proc_dir", type=str,
@@ -712,10 +959,23 @@ if __name__ == "__main__":
                         help="Directory containing per-object BPS slot cache")
     parser.add_argument("--mano_assets_root", type=str, default="assets/mano_v1_2",
                         help="MANO assets root for building vertex-to-hand-part mapping")
+    parser.add_argument("--diversity_cls_num", type=int, default=20,
+                        help="Upper bound of KMeans cluster count for diversity mode")
+    parser.add_argument("--diversity_unit", type=str, default="cm",
+                        choices=["m", "cm", "mm"],
+                        help="Unit scaling applied before diversity clustering")
+    parser.add_argument("--diversity_canonical", action=argparse.BooleanOptionalAction, default=True,
+                        help="Canonicalize joints before diversity clustering")
+    parser.add_argument("--diversity_group_by", type=str, default="group_id",
+                        choices=["group_id", "obj_sample", "obj_id"],
+                        help="Grouping key for diversity mode")
     parser.add_argument("-g", "--gpu_id", type=str, default="1")
     args = parser.parse_args()
 
     os.environ["OMP_NUM_THREADS"]    = "1"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
-    evaluate(args)
+    if args.mode == "diversity":
+        evaluate_diversity(args)
+    else:
+        evaluate_quality(args)

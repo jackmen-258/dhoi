@@ -37,7 +37,7 @@ from data.token_encoder import TokenEncoder
 from models.condition_encoder import BPSSlotPredictor, build_token_histogram
 from models.pose_decoder import (
     build_grab_model, ROT6D_POSE_DIM, TRANS_DIM, NUM_HAND_PARTS, NUM_SLOTS,
-    point2point_signed, compute_geo_loss,
+    point2point_signed,
     build_vert_to_part, build_part_contact_masks,
     propagate_slot_labels, compute_part_contact_loss,
     RefineNet, compute_refine_loss, sanitize_posegrab_state_dict_for_load,
@@ -965,7 +965,6 @@ class Trainer:
         loss_total, loss_dict = self.model.compute_coarse_loss(
             drec, dorig, verts_pred, gt_verts, obj_pc,
             rh_faces, self.v_weights, self.v_weights2, B,
-            obj_normals=obj_vn,
         )
 
         # ---- Part-Contact Consistency Loss ----
@@ -1139,7 +1138,6 @@ class Trainer:
             loss_total, loss_dict = self.model.compute_coarse_loss(
                 drec, dorig, verts_pred, gt_verts, obj_pc,
                 rh_faces, self.v_weights, self.v_weights2, B,
-                obj_normals=obj_vn,
             )
 
             # Sample-based metrics use a single fixed prior seed for determinism.
